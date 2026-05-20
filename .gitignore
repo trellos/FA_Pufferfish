@@ -1,0 +1,25 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+*.log
+
+# Local development artifacts
+.claude/settings.local.json
+
+# Screenshots and side-by-side comparisons generated during iteration
+current_*.png
+final_*.png
+sidebyside_*.png
+screenshot-*.png
+screenshot.cjs
+ref_*.png
+
+# Reference video frames (large, local-only)
+video_frames/
+reference/
+
+# IDE
+.vscode/
+.idea/
+*.swp
