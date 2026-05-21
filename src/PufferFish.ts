@@ -150,22 +150,6 @@ export class PufferFish {
     ctx.restore();
   }
 
-  // Draw tinted image centered at (dx, dy).
-  private blit(
-    ctx: CanvasRenderingContext2D,
-    name: string,
-    dx: number, dy: number,
-    w: number,  h: number,
-    alpha = 1,
-  ): void {
-    const img = this.imgs[name];
-    if (!img?.tinted) return;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.drawImage(img.tinted, dx - w / 2, dy - h / 2, w, h);
-    ctx.restore();
-  }
-
   // cx/cy: center. baseR: radius at scale=1. scale: 0.78–1.22. phaseT: 0–1 within current phase.
   render(
     ctx: CanvasRenderingContext2D,
@@ -173,7 +157,7 @@ export class PufferFish {
     baseR: number,
     scale: number,
     phase: BreathPhase,
-    phaseT = 0,
+    _phaseT = 0,
   ): void {
     if (!this.ready) return;
 

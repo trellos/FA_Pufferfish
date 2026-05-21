@@ -1,0 +1,27 @@
+{
+  "name": "FA_Pufferfish",
+  "image": "mcr.microsoft.com/playwright:v1.44.0-jammy",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "forwardPorts": [5173],
+  "portsAttributes": {
+    "5173": {
+      "label": "Vite dev server",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "bash setup.sh",
+  "remoteUser": "node",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-playwright.playwright",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  }
+}

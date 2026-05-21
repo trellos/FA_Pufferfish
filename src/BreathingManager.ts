@@ -44,7 +44,7 @@ export class BreathingManager {
 
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx  = canvas.getContext('2d')!;
-    this.fish = new PufferFish('/assets/');
+    this.fish = new PufferFish(`${import.meta.env.BASE_URL}assets/`);
     this.cycleSecs   = urlNum('cycle',    8);
     this.sessionSecs = urlNum('duration', 60);
   }
