@@ -248,20 +248,18 @@ export class PufferFish {
     this.buildBody(ctx, sx, sy);
     ctx.clip();
 
-    // The dark belly covers ~bottom 70% of the silhouette. Its TOP edge sits
-    // at y ≈ -0.40*baseR — about 30% down from the silhouette top — so the
-    // bright cyan head arc occupies the upper ~third. Centre is lower
-    // (+0.40*baseR) so the ellipse bottom extends past the silhouette bottom
-    // and gets clipped flush. The gradient is dark at the top, holds dark
-    // through ~mid, then BRIGHTENS noticeably toward the bottom — matching
-    // the reference belly which sampled #159FDC → #1CC3ED → #21EDF7 from
-    // top to bottom. The bottom is bright cyan but slightly cooler than the
-    // head crown (#39E8FB) so head/belly aren't identical.
-    const bellyCY = baseR * 0.40;            // belly centre, well below mid
+    // The dark belly covers ~bottom half of the silhouette. Its TOP edge sits
+    // at y ≈ -0.19*baseR — just below the bottom edge of the Mouth_Circle
+    // sprite (which spans y -0.57..-0.19 when drawn at width 0.38*baseR with
+    // its 1:1 aspect). Reference Breathe-Out shows the dark belly "barely
+    // touching" the bottom of the big nose, so the bright cyan head + face
+    // occupy the top ~40% of the silhouette and the dark belly fills the
+    // lower ~60%.
+    const bellyCY = baseR * 0.61;            // belly centre — top lands at -0.19
     const bellyRX = baseR * 1.10;            // wider than silhouette → clipped to outline
-    const bellyRY = baseR * 0.80;            // tall — top at -0.40, bottom at +1.20 (clipped)
-    const bellyTop = bellyCY - bellyRY;       // y of belly top (≈ -0.40)
-    const bellyBot = bellyCY + bellyRY;       // y of belly bottom (≈ +1.20, clipped)
+    const bellyRY = baseR * 0.80;            // tall — top at -0.19, bottom at +1.41 (clipped)
+    const bellyTop = bellyCY - bellyRY;       // y of belly top (≈ -0.19)
+    const bellyBot = bellyCY + bellyRY;       // y of belly bottom (≈ +1.41, clipped)
     const bg = ctx.createLinearGradient(0, bellyTop, 0, bellyBot);
     bg.addColorStop(0.00, '#159FDC');   // dark blue at top
     bg.addColorStop(0.35, '#159FDC');   // hold dark until ~middle
@@ -275,11 +273,11 @@ export class PufferFish {
 
     // ── 6. Belly dots (clipped to silhouette) ──────────────────────────────
     // Belly_Dots.png is wide (~429×144). Draw ONCE only — the asset itself
-    // contains all the dots. Belly now starts at y ≈ -0.40, so dots sit
-    // a bit lower at y ≈ +0.30 to land mid-belly (between belly top -0.40
-    // and silhouette bottom +1.05).
+    // contains all the dots. Belly now starts at y ≈ -0.19, so dots sit at
+    // y ≈ +0.42 to land mid-belly (between belly top -0.19 and silhouette
+    // bottom +1.05).
     const dotW  = baseR * 1.05;
-    const dotDY = baseR * 0.30;
+    const dotDY = baseR * 0.42;
     this.blit(ctx, 'Belly_Dots', dotW, 0, dotDY, 0.95);
     ctx.restore();
 
