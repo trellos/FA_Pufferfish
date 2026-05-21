@@ -1,25 +1,47 @@
-// PufferFish — Canvas 2D renderer using sprite layers.
-// Layer order (back to front): Spikes(×10) → Wings → Body(bright cyan) → Dark Belly Overlay → Belly_Dots → Face
-// Phases (verified by reference frame inspection):
-//   inhale (early)                → furrowed brows + Eyes_1     + Nose_Closed + Mouth_Closed
-//   inhale (late, scale ≥ 1.05)   → Eyes_Relax    + Nose_Open   + Mouth_Closed
-//   hold                          → Eyes_Relax    + Nose_Closed + Mouth_Closed   (peaceful, no brows)
-//   exhale                        → Eyes_Relax    + Nose_Open   + Mouth_Circle + puff lines
+// PufferFish — Canvas 2D sprite compositor.
+//
+// The silhouette is ONE smooth egg-shaped ellipse (slightly wider at the
+// bottom). The "dark belly" is NOT a separate body — it's a darker gradient
+// region drawn INSIDE the silhouette, clipped to the outer outline. This
+// avoids the "snowman bisection" effect where a head circle pokes above a
+// belly circle: the outer outline is a single curve.
+//
+// All drawable bits (spikes, wings, dots, glow, eyes/nose/mouth) are
+// pre-tinted PNG sprites blitted with drawImage. The body silhouette is
+// drawn with ellipse() so we can apply gradient fills cleanly.
+//
+// Layer order (back to front):
+//   1. Glow.png         — soft halo (low alpha, screen blend)
+//   2. Wings            — drawn BEHIND body; inner half is covered by body,
+//                         outer half peeks past the body edge
+//   3. Spikes ×10       — also BEHIND body; only the outer tips visible
+//   4. Body fill        — bright cyan ellipse (the silhouette base)
+//   5. Dark belly       — gradient ellipse clipped to the silhouette (inside)
+//   6. Belly_Dots.png   — bright cyan, clipped to the silhouette (drawn ONCE)
+//   7. Face features    — eyes/nose/mouth in upper third of the silhouette
+//
+// Phases:
+//   inhale  → Eyes_Relax + Nose_Open    + Mouth_Closed
+//   hold    → Eyes_Closed + Nose_Closed + Mouth_Closed   (both at eye row → angry look)
+//   exhale  → Eyes_Relax  + Mouth_Circle (large central nose; no Nose_Closed)
 
 export type BreathPhase = 'inhale' | 'hold' | 'exhale';
 
 const TINT = {
-  wing:     '#ffffff',
-  dots:     '#80EEFF',
-  eye:      '#0A2060',
-  nose:     '#0A2060',
-  mouth:    '#0A2060',
-  glow:     '#00F0FF',
-  // Gradient_1 sprite is currently unused; tint kept for asset loader consistency.
-  belly:    '#159FDD',
+  wing:        '#FFFFFF',
+  dots:        '#80EEFF',
+  face:        '#0F80C2',          // medium blue for eyes/nose-marks/mouth-dash
+  mouthCircle: '#0F80C2',          // big central nose — same medium blue as other features
+  glow:        '#C8F4FF',
+  spike:       'rgb(57,232,251)',  // body-cyan
 } as const;
 
 const SPIKE_COUNT = 10;
+
+// Silhouette half-extents relative to baseR. Almost a perfect circle in the
+// reference — very slightly wider than tall. Bottom-half flare is subtle.
+const SX_FACTOR = 1.05;
+const SY_FACTOR = 1.02;
 
 interface Img { el: HTMLImageElement; tinted: HTMLCanvasElement }
 
@@ -31,25 +53,20 @@ export class PufferFish {
 
   async load(): Promise<void> {
     const defs: [string, string][] = [
-      ['Wing_R',       TINT.wing     ],
-      ['Belly_Dots',   TINT.dots     ],
-      ['Eyes_1',       TINT.eye      ],
-      ['Eyes_Relax',   TINT.eye      ],
-      ['Eyes_Closed',  TINT.eye      ],
-      ['Nose_Open',    TINT.nose     ],
-      ['Nose_Closed',  TINT.nose     ],
-      ['Mouth_Circle', TINT.mouth    ],
-      ['Mouth_Closed', TINT.mouth    ],
-      ['Glow',         TINT.glow     ],
-      ['Gradient_1',   TINT.belly    ],
+      ['Wing_R',       TINT.wing        ],
+      ['Belly_Dots',   TINT.dots        ],
+      ['Eyes_1',       TINT.face        ],
+      ['Eyes_Relax',   TINT.face        ],
+      ['Eyes_Closed',  TINT.face        ],
+      ['Nose_Open',    TINT.face        ],
+      ['Nose_Closed',  TINT.face        ],
+      ['Mouth_Circle', TINT.mouthCircle ],  // big nose — belly-cyan, not navy
+      ['Mouth_Closed', TINT.face        ],
+      ['Glow',         TINT.glow        ],
+      ['Spike1',       TINT.spike       ],
     ];
-    await Promise.all([...defs.map(([n]) => n), 'Spike1'].map(n => this.loadOne(n)));
+    await Promise.all(defs.map(([n]) => this.loadOne(n)));
     for (const [n, c] of defs) this.makeTinted(n, c);
-    // Reference spikes are uniform body-cyan rgb(57,232,251). Tint all 10
-    // spike variants identically — no per-angle darkening.
-    for (let i = 0; i < SPIKE_COUNT; i++) {
-      this.makeTintedFrom('Spike1', `spike_${i}`, 'rgb(57,232,251)');
-    }
     this.ready = true;
   }
 
@@ -77,80 +94,47 @@ export class PufferFish {
     this.imgs[name].tinted = oc;
   }
 
-  // Creates a tinted copy of srcName stored under a different dstName key (for spike variants).
-  private makeTintedFrom(srcName: string, dstName: string, color: string): void {
-    const src = this.imgs[srcName]?.el;
-    if (!src) return;
-    const w = src.naturalWidth  || 64;
-    const h = src.naturalHeight || 64;
-    const oc = document.createElement('canvas');
-    oc.width = w; oc.height = h;
-    const cx = oc.getContext('2d')!;
-    cx.drawImage(src, 0, 0);
-    cx.globalCompositeOperation = 'source-in';
-    cx.fillStyle = color;
-    cx.fillRect(0, 0, w, h);
-    this.imgs[dstName] = { el: src, tinted: oc };
-  }
-
-  // Draw a striped wing fin. sx = +1 for right wing, -1 for left wing.
-  // Reference shows a small scalloped fan at the body equator: white fan-shape
-  // with ~3 thin dark parallel stripes inside, base attached at the body edge.
-  private drawWing(ctx: CanvasRenderingContext2D, sx: number, r: number): void {
-    const wW = r * 0.32;          // outward extent past body edge
-    const wH = r * 0.28;          // vertical span
-    // Position wing at upper-mid level (y=-0.50r) where the body silhouette is
-    // narrower (~0.87 of equator width), so wings remain visible past the body
-    // even at HOLD scale=1.22 where the equator overflows the canvas.
-    // Body x-radius at y=-0.50r is sqrt(1-0.25)*r = 0.866r.
-    const anchorY = -r * 0.50;
-    const anchorX = sx * r * 0.866;
-
-    ctx.save();
-    ctx.translate(anchorX, anchorY);
-    ctx.scale(sx, 1);
-
-    // Fan shape — base on the inner side (x=0), curves out and around to tip at wW.
-    // Build a leaf/scallop with a pointed tip.
-    ctx.beginPath();
-    ctx.moveTo(0, -wH * 0.40);                                             // inner upper
-    ctx.quadraticCurveTo(wW * 0.55, -wH * 0.55, wW * 1.05, -wH * 0.05);   // arc to tip
-    ctx.quadraticCurveTo(wW * 0.70,  wH * 0.25, wW * 0.20,  wH * 0.45);   // arc back to inner lower
-    ctx.quadraticCurveTo(-wW * 0.05, wH * 0.10, 0,         -wH * 0.40);   // close along inner edge
-    ctx.closePath();
-
-    ctx.fillStyle   = '#E8F0FA';                  // bright off-white like reference
-    ctx.strokeStyle = 'rgba(20,50,130,0.45)';
-    ctx.lineWidth   = r * 0.012;
-    ctx.fill();
-    ctx.stroke();
-
-    // Stripes — thin parallel dark lines that radiate from the inner base
-    // toward the tip, giving the wing a "feathered" segmented look.
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(0, -wH * 0.40);
-    ctx.quadraticCurveTo(wW * 0.55, -wH * 0.55, wW * 1.05, -wH * 0.05);
-    ctx.quadraticCurveTo(wW * 0.70,  wH * 0.25, wW * 0.20,  wH * 0.45);
-    ctx.quadraticCurveTo(-wW * 0.05, wH * 0.10, 0,         -wH * 0.40);
-    ctx.closePath();
-    ctx.clip();
-    ctx.strokeStyle = 'rgba(20,50,130,0.55)';
-    ctx.lineWidth   = r * 0.014;
-    ctx.lineCap     = 'round';
-    const stripeOffsets = [-wH * 0.15, 0, wH * 0.15];
-    for (const so of stripeOffsets) {
-      ctx.beginPath();
-      ctx.moveTo(wW * 0.05, so + wH * 0.15);
-      ctx.quadraticCurveTo(wW * 0.50, so + wH * 0.02, wW * 0.95, so - wH * 0.08);
-      ctx.stroke();
+  // Draw a tinted sprite centered at the current origin, scaled to `targetW`
+  // while preserving aspect ratio. Optionally offset by (dx,dy) and rotated.
+  private blit(
+    ctx: CanvasRenderingContext2D,
+    name: string,
+    targetW: number,
+    dx = 0, dy = 0,
+    alpha = 1,
+  ): void {
+    const img = this.imgs[name]?.tinted;
+    if (!img) return;
+    const aspect = img.height / img.width;
+    const w = targetW;
+    const h = targetW * aspect;
+    if (alpha !== 1) {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(img, dx - w / 2, dy - h / 2, w, h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(img, dx - w / 2, dy - h / 2, w, h);
     }
-    ctx.restore();
-
-    ctx.restore();
   }
 
-  // cx/cy: center. baseR: radius at scale=1. scale: 0.78–1.22. phaseT: 0–1 within current phase.
+  // Build the single outer silhouette path. Almost-circular with a very slight
+  // bottom flare. Centered at (0,0).
+  // Top half: ellipse with (sx, sy*0.98).
+  // Bottom half: ellipse with (sx, sy*1.02) — a touch fuller below.
+  private buildBody(ctx: CanvasRenderingContext2D, sx: number, sy: number): void {
+    ctx.beginPath();
+    // Top half (left → top → right)
+    ctx.ellipse(0, 0, sx, sy * 0.98, 0, Math.PI, 0, false);
+    // Bottom half (right → bottom → left) — slightly fuller
+    ctx.ellipse(0, 0, sx, sy * 1.02, 0, 0, Math.PI, false);
+    ctx.closePath();
+  }
+
+  // cx/cy:  fish center in screen space (silhouette center).
+  // baseR:  body radius unit at scale=1.
+  // scale:  0.78 .. 1.22.
+  // phase:  'inhale' | 'hold' | 'exhale'.
   render(
     ctx: CanvasRenderingContext2D,
     cx: number, cy: number,
@@ -165,223 +149,189 @@ export class PufferFish {
     ctx.translate(cx, cy);
     ctx.scale(scale, scale);
 
-    const r = baseR;
+    const sx = baseR * SX_FACTOR;
+    const sy = baseR * SY_FACTOR;
+    // Effective bottom-half scale (matches buildBody's bottom-half ellipse).
+    const sxBot = sx;
+    const syBot = sy * 1.02;
+    const syTop = sy * 0.98;
 
-    // Glow.png is a solid circle — skip it; background radial handles the bloom.
+    // ── 1. Glow halo ───────────────────────────────────────────────────────
+    // Soft bloom around the fish — a gentle halo of light, not a bright ring.
+    // Diameter ~2.6× baseR gives the halo room to extend just past the spikes;
+    // alpha 0.18 keeps it visible against the dark sky without washing out.
+    const glowW = baseR * 2.6;
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    this.blit(ctx, 'Glow', glowW, 0, 0, 0.18);
+    ctx.restore();
 
-    // ── Spikes (Spike1.png rotated ×10, behind body) ──────────────────────
-    const spikeBodyR = r * 0.95;
-    const spikeSize  = r * 0.22;
-    for (let i = 0; i < SPIKE_COUNT; i++) {
-      const angle = (i / SPIKE_COUNT) * Math.PI * 2 - Math.PI / 2;
-      const img = this.imgs[`spike_${i}`];
-      if (!img?.tinted) continue;
+    // ── 2. Wings (BEHIND body — inner ~30 % covered, outer ~70 % peeks out) ─
+    // Anchor the wing NEAR the body edge and offset the sprite so only its
+    // INNER ~30 % is tucked behind the silhouette; ~70 % of the wing remains
+    // visible outside the body. Matches the reference where wings clearly
+    // stick out past the silhouette rather than hiding behind it.
+    //
+    // Wings FLAP using a fast sine oscillation around the body-edge anchor.
+    // Flap is driven by absolute time (not breath phase) so the flutter runs
+    // at a consistent rhythm regardless of cycle length — matches the
+    // reference video where wings flap continuously through the cycle.
+    const flapHz    = 1.8;
+    const flapAngle = Math.sin(performance.now() / 1000 * flapHz * Math.PI * 2) * 0.18; // ±~10°
+    const wingW  = baseR * 0.36;
+    const wingH  = baseR * 0.28;
+    // Wings sit UP at face level (above the i=2/i=3 side spikes which are at
+    // angle ±18° from equator, y ≈ -0.32*baseR). At wingY = -0.55*baseR with
+    // wingH = 0.28*baseR, the wing spans y = -0.69..-0.41 vertically — clears
+    // the side spikes (y ≈ -0.32) entirely. wingAnchorX = sx * 0.84 lands on
+    // the silhouette edge at this Y (sqrt(1 - 0.55²/1.02²) ≈ 0.84).
+    const wingY  = -baseR * 0.55;
+    const wingAnchorX = sx * 0.84;
+    const wImg = this.imgs['Wing_R']?.tinted;
+    if (wImg) {
+      // Right wing — sprite anchored so only inner 30 % is hidden by body.
+      // Rotate around the anchor so the wing pivots from where it joins the body.
       ctx.save();
-      ctx.rotate(angle);
-      ctx.translate(0, -spikeBodyR);
-      // Bottom edge of sprite at the body-surface; spike extends outward
-      ctx.drawImage(img.tinted, -spikeSize / 2, -spikeSize, spikeSize, spikeSize);
+      ctx.translate(wingAnchorX, wingY);
+      ctx.rotate(flapAngle);
+      ctx.drawImage(wImg, -wingW * 0.30, -wingH / 2, wingW, wingH);
+      ctx.restore();
+
+      // Left wing — mirrored. Opposite flap direction keeps the motion
+      // symmetric (both wings rise/fall together, not in lockstep).
+      ctx.save();
+      ctx.translate(-wingAnchorX, wingY);
+      ctx.scale(-1, 1);
+      ctx.rotate(flapAngle);
+      ctx.drawImage(wImg, -wingW * 0.30, -wingH / 2, wingW, wingH);
       ctx.restore();
     }
 
-    // ── Wings (striped feather-fins at equator) ──────────────────────────────
-    // Drawn programmatically — reference shows white wings with 3–4 thin parallel
-    // stripes separating "feather" segments. Sprite Wing_R.png is solid so we add
-    // stripes by overdrawing dark thin lines.
-    this.drawWing(ctx, +1, r);
-    this.drawWing(ctx, -1, r);
+    // ── 3. Spikes (BEHIND body — only outer tips peek past the silhouette) ─
+    // Spikes are SMALL thorns evenly spaced around the ellipse. For each
+    // angle θ on the outline, the surface point is (sx*cos θ, sy*sin θ)
+    // (top or bottom ellipse). The sprite points UP by default; rotate it
+    // to align with the outward radial. Drawn before the body fill so the
+    // body silhouette covers the inner portion.
+    const spikeSize = baseR * 0.18;
+    const spImg = this.imgs['Spike1']?.tinted;
+    if (spImg) {
+      const w = spikeSize;
+      const h = spikeSize * (spImg.height / spImg.width);
+      // All 10 spikes drawn — no equator skip. Wings sit at face level
+      // (wingY = -baseR * 0.55) so the i=2/i=3 side spikes at y ≈ -0.32*baseR
+      // are clear of the wing footprint.
+      for (let i = 0; i < SPIKE_COUNT; i++) {
+        const t  = (i / SPIKE_COUNT) * Math.PI * 2 - Math.PI / 2;
+        const dx = Math.cos(t), dy = Math.sin(t);
+        const ex = dy > 0 ? sxBot : sx;
+        const ey = dy > 0 ? syBot : syTop;
+        const px = dx * ex;
+        const py = dy * ey;
+        const angle = Math.atan2(dy, dx) + Math.PI / 2;
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(angle);
+        ctx.drawImage(spImg, -w / 2, -h * 0.85, w, h);
+        ctx.restore();
+      }
+    }
 
-    // ── Body: solid bright cyan crown ────────────────────────────────────────
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fillStyle = '#39E8FB';  // crown rgb(57,232,251)
+    // ── 4. Body fill (the single silhouette in bright cyan) ────────────────
+    this.buildBody(ctx, sx, sy);
+    ctx.fillStyle = '#39E8FB';
     ctx.fill();
 
-    // ── Dark belly (large ellipse clipped to body circle) ────────────────────
-    // Verified by pixel sampling frame_015.jpg (1080×1920, body radius=605 at scale=1.22):
-    //   • Dark color rgb(21,159,221). Upper edge is a curve peaking at center y=-0.45r;
-    //     it spreads to the body sides by y≈+0.18r (where dark spans full body width).
-    //   • The dark belly extends past the bottom of the body and is clipped by the
-    //     body circle — so the bottom of the dark region IS the body's lower arc.
-    //   • Below the dark belly's bottom-most lighter brightening: a small bright
-    //     cyan crescent rim at the very bottom of the body (where the gradient
-    //     finishes brightening just inside the body circle).
-    //   • Ellipse fit: center (0, +0.30r), rx≈1.05r, ry≈0.75r → top at -0.45r;
-    //     spans full body width by y≈+0.20r.
+    // ── 5. Dark belly region — clipped to silhouette ───────────────────────
+    // Rebuild silhouette path for clipping (clip consumes the path).
     ctx.save();
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    this.buildBody(ctx, sx, sy);
     ctx.clip();
 
-    const bellyCY = r * 0.22;
-    const bellyRX = r * 1.05;
-    const bellyRY = r * 0.82;
-    // Gradient — dark across most of belly, thin bright rim only at very bottom.
-    // Reference belly is rgb(21,159,221) #159FDD across upper/middle and brightens
-    // only in the last ~10% to produce the thin crescent rim at body bottom.
-    const bg = ctx.createLinearGradient(0, bellyCY - bellyRY, 0, bellyCY + bellyRY);
-    bg.addColorStop(0.00, '#159FDD');
-    bg.addColorStop(0.55, '#159FDD');
-    bg.addColorStop(0.78, '#19AEE3');
-    bg.addColorStop(0.92, '#27D2EF');
-    bg.addColorStop(1.00, '#39E8FB');
+    // The dark belly covers ~bottom 70% of the silhouette. Its TOP edge sits
+    // at y ≈ -0.40*baseR — about 30% down from the silhouette top — so the
+    // bright cyan head arc occupies the upper ~third. Centre is lower
+    // (+0.40*baseR) so the ellipse bottom extends past the silhouette bottom
+    // and gets clipped flush. The gradient is dark at the top, holds dark
+    // through ~mid, then BRIGHTENS noticeably toward the bottom — matching
+    // the reference belly which sampled #159FDC → #1CC3ED → #21EDF7 from
+    // top to bottom. The bottom is bright cyan but slightly cooler than the
+    // head crown (#39E8FB) so head/belly aren't identical.
+    const bellyCY = baseR * 0.40;            // belly centre, well below mid
+    const bellyRX = baseR * 1.10;            // wider than silhouette → clipped to outline
+    const bellyRY = baseR * 0.80;            // tall — top at -0.40, bottom at +1.20 (clipped)
+    const bellyTop = bellyCY - bellyRY;       // y of belly top (≈ -0.40)
+    const bellyBot = bellyCY + bellyRY;       // y of belly bottom (≈ +1.20, clipped)
+    const bg = ctx.createLinearGradient(0, bellyTop, 0, bellyBot);
+    bg.addColorStop(0.00, '#159FDC');   // dark blue at top
+    bg.addColorStop(0.35, '#159FDC');   // hold dark until ~middle
+    bg.addColorStop(0.70, '#1CC3ED');   // medium brightening
+    bg.addColorStop(0.90, '#21E0F0');   // bright cyan band
+    bg.addColorStop(1.00, '#27E8F5');   // bright cyan, slightly cooler than head crown
     ctx.fillStyle = bg;
-    // Custom path: flatter top edge — control points pulled outward (wider)
-    // so the top arc is gentler/flatter through the middle instead of pointed.
     ctx.beginPath();
-    ctx.moveTo(-bellyRX, bellyCY);
-    // Top: flatter curve — control points wider than the bounding rect to push
-    // the top peak DOWN (flatter middle).
-    ctx.bezierCurveTo(
-      -bellyRX * 0.78,    bellyCY - bellyRY * 1.05,
-       bellyRX * 0.78,    bellyCY - bellyRY * 1.05,
-       bellyRX,           bellyCY,
-    );
-    // Bottom: standard ellipse-like curve
-    ctx.bezierCurveTo(
-       bellyRX,           bellyCY + bellyRY * 1.05,
-      -bellyRX,           bellyCY + bellyRY * 1.05,
-      -bellyRX,           bellyCY,
-    );
-    ctx.closePath();
+    ctx.ellipse(0, bellyCY, bellyRX, bellyRY, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // ── Belly dots (anchored within visible dark belly, fan pattern) ─────────
-    // Reference frame_015: 4-row dot fan pattern within the dark belly,
-    // located in the upper-middle of the dark belly. Dots are a slightly
-    // lighter cyan than the dark belly proper.
-    this.drawBellyDots(ctx, r, bellyCY);
+    // ── 6. Belly dots (clipped to silhouette) ──────────────────────────────
+    // Belly_Dots.png is wide (~429×144). Draw ONCE only — the asset itself
+    // contains all the dots. Belly now starts at y ≈ -0.40, so dots sit
+    // a bit lower at y ≈ +0.30 to land mid-belly (between belly top -0.40
+    // and silhouette bottom +1.05).
+    const dotW  = baseR * 1.05;
+    const dotDY = baseR * 0.30;
+    this.blit(ctx, 'Belly_Dots', dotW, 0, dotDY, 0.95);
     ctx.restore();
 
-    // Face features. Reference frame_015 (1080×1920, body radius=605 @ scale=1.22):
-    //   • Nose dots:   ±0.12r horizontal, y = -0.77r  (TOPMOST — above eyes)
-    //   • Eye arcs:    ±0.39r horizontal, y = -0.68r  (middle)
-    //   • Mouth dash:  centered,          y = -0.61r  (lowest, half-width ~0.12r)
-    //   • Feature color: rgb(~10,128,196) ≈ #0B7FC4 (saturated dark teal,
-    //     NOT navy — verified by sampling darkest face pixels in the reference)
+    // ── 7. Face features (upper third of silhouette) ───────────────────────
+    // Face center sits in the UPPER THIRD of the silhouette. Bright cyan
+    // head spans from y ≈ -1.00*baseR (silhouette top) down to ≈ -0.40*baseR
+    // (belly top edge), so its midpoint is ≈ -0.70*baseR. y is relative to
+    // silhouette centre; negative is up.
+    //
+    // Important: there are NO separate brow marks. During Hold, Nose_Closed
+    // and Eyes_Closed are drawn at the SAME y, so the asset's internal
+    // positioning produces the angled "squinty" marks above the eye dashes
+    // organically — one merged row, not two.
+    const hr = baseR;
+    const EYES_Y     = -hr * 0.52;   // Eyes_Relax / Eyes_Closed
+    const NOSE_Y     = -hr * 0.52;   // Nose_Open / Nose_Closed — same row as eyes
+    const MOUTH_Y    = -hr * 0.30;   // Mouth_Closed dash, just below the eye row
+    const BIG_NOSE_Y = -hr * 0.38;   // Mouth_Circle, slightly below eye row
 
-    const NOSE_Y  = -r * 0.77;
-    const EYE_Y   = -r * 0.68;
-    const MOUTH_Y = -r * 0.61;
-    const FACE_COLOR = '#0B7FC4';
+    // Face features are tinted PNGs with set stroke thickness. To make them
+    // appear THINNER/SOFTER (closer to the reference), draw at alpha 0.80 so
+    // they read as "shaded" features rather than bold paint strokes.
+    const FACE_ALPHA = 0.80;
 
-    // ── Eyes ──────────────────────────────────────────────────────────────
-    if (phase === 'inhale' && scale < 1.05) {
-      // Early inhale: concentration face — furrowed brows + alert round-dot eyes.
-      // Position brows above the eye arcs (push to eye row Y).
-      ctx.save();
-      ctx.strokeStyle = FACE_COLOR;
-      ctx.lineWidth   = r * 0.030;
-      ctx.lineCap     = 'round';
-      ctx.beginPath(); ctx.moveTo(-r * 0.45, EYE_Y - r * 0.10); ctx.lineTo(-r * 0.30, EYE_Y - r * 0.07); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo( r * 0.30, EYE_Y - r * 0.07); ctx.lineTo( r * 0.45, EYE_Y - r * 0.10); ctx.stroke();
-      // Round alert-dot eyes
-      ctx.fillStyle = FACE_COLOR;
-      ctx.beginPath(); ctx.arc(-r * 0.39, EYE_Y, r * 0.045, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc( r * 0.39, EYE_Y, r * 0.045, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
+    if (phase === 'inhale') {
+      // Eyes_Relax + Nose_Open + Mouth_Closed.
+      // Reference p_008 (Breathe In) shows: nose dots close together, and a
+      // VERY SHORT mouth dash. Width 0.32*hr keeps the mouth subtle.
+      this.blit(ctx, 'Eyes_Relax',   hr * 1.55, 0, EYES_Y,    FACE_ALPHA);
+      this.blit(ctx, 'Nose_Open',    hr * 0.30, 0, NOSE_Y,    FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', hr * 0.32, 0, MOUTH_Y,   FACE_ALPHA);
+    } else if (phase === 'hold') {
+      // Hold face: 4 distinct angled marks on the eye row + mouth dash.
+      // Eyes_Closed.png has 2 dashes at the FAR L/R edges of its bounding
+      // box, so its width controls how far apart the OUTER dashes sit.
+      // Nose_Closed.png has 2 angled slashes ALSO at the FAR L/R edges,
+      // so drawing it MUCH NARROWER places those slashes near the CENTRE,
+      // producing the INNER pair. The big size difference is intentional:
+      // outer pair lands at ±~0.62*hr, inner pair at ±~0.20*hr.
+      this.blit(ctx, 'Eyes_Closed',  hr * 1.30, 0, EYES_Y,    FACE_ALPHA);
+      this.blit(ctx, 'Nose_Closed',  hr * 0.42, 0, NOSE_Y,    FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', hr * 0.55, 0, MOUTH_Y,   FACE_ALPHA);
     } else {
-      // Hold / late inhale / exhale: draw closed-U eye arcs flanking the nose.
-      // Reference shows thick ∪ arcs (opening upward = sleeping/smiling eyes).
-      ctx.save();
-      ctx.strokeStyle = FACE_COLOR;
-      ctx.lineWidth   = r * 0.030;
-      ctx.lineCap     = 'round';
-      const eyeR  = r * 0.075;
-      const eyeDX = r * 0.39;
-      ctx.beginPath(); ctx.arc(-eyeDX, EYE_Y, eyeR, Math.PI, 0, true); ctx.stroke();
-      ctx.beginPath(); ctx.arc( eyeDX, EYE_Y, eyeR, Math.PI, 0, true); ctx.stroke();
-      ctx.restore();
+      // exhale — Eyes_Relax + Mouth_Circle (big nose). NO Nose_Closed: the
+      // big central nose IS the feature; adding brows would clutter it.
+      // Reference c_025 shows the central nose much smaller than before —
+      // it's a defined feature but doesn't dominate the face. Dropping the
+      // width from 0.60 → 0.38 brings it in line with the reference.
+      this.blit(ctx, 'Eyes_Relax',   hr * 1.55, 0, EYES_Y,     FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Circle', hr * 0.38, 0, BIG_NOSE_Y, FACE_ALPHA);
     }
 
-    // ── Nose: two small dark filled circles, centered, ABOVE eye row ──────
-    if (phase === 'exhale' || (phase === 'inhale' && scale >= 1.05)) {
-      // Open nose during exhale / late inhale — slightly larger ovals
-      ctx.save();
-      ctx.fillStyle = FACE_COLOR;
-      const nDX = r * 0.12;
-      const nRX = r * 0.045;
-      const nRY = r * 0.052;
-      ctx.beginPath(); ctx.ellipse(-nDX, NOSE_Y, nRX, nRY, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.ellipse( nDX, NOSE_Y, nRX, nRY, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    } else {
-      // Closed nose: two small dark filled circles
-      ctx.save();
-      ctx.fillStyle = FACE_COLOR;
-      const nDX = r * 0.12;
-      const nR  = r * 0.042;
-      ctx.beginPath(); ctx.arc(-nDX, NOSE_Y, nR, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc( nDX, NOSE_Y, nR, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    }
-
-    // ── Mouth ─────────────────────────────────────────────────────────────
-    if (phase === 'exhale') {
-      // Small puckered "kiss" O-mouth — outlined ring (not solid dot) below
-      // the nose row. Fill with a slightly darker cyan than body to give the
-      // pursed-lip look from the reference.
-      ctx.save();
-      ctx.fillStyle = 'rgb(35,180,225)';
-      ctx.strokeStyle = FACE_COLOR;
-      ctx.lineWidth = r * 0.022;
-      ctx.beginPath();
-      ctx.arc(0, MOUTH_Y, r * 0.045, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
-      // Particle puff is now handled by BreathingManager's particle system.
-    } else {
-      // Thin horizontal mouth dash — reference is ~0.24r wide, ~0.025r thick.
-      ctx.save();
-      ctx.strokeStyle = FACE_COLOR;
-      ctx.lineCap = 'round';
-      ctx.lineWidth = r * 0.028;
-      ctx.beginPath();
-      ctx.moveTo(-r * 0.12, MOUTH_Y);
-      ctx.lineTo( r * 0.12, MOUTH_Y);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    ctx.restore();
-  }
-
-  // Draw the dot pattern matching reference frame_015.
-  // Reference shows ~11 elongated teardrop-shaped dots arranged in 3 rows
-  // (4 + 4 + 3) within the upper portion of the dark belly. Dots are larger
-  // and more elliptical (vertical ovals) than perfect circles.
-  private drawBellyDots(
-    ctx: CanvasRenderingContext2D,
-    r: number,
-    _bellyCY: number,
-  ): void {
-    ctx.save();
-    ctx.fillStyle = '#22EEF7';  // bright cyan dot color (~ rgb 34,238,247 from reference)
-    // Hand-positioned dots matching the visible reference layout. Reference has
-    // organic spacing — not strictly grid-aligned. Each entry: [xR, yR, rxR, ryR].
-    // rx < ry to make them tall/oval teardrops like the reference.
-    const dots: Array<[number, number, number, number]> = [
-      // Top row (4 dots, widest spread) — smaller round dots
-      [-0.36, -0.18, 0.045, 0.050],
-      [-0.10, -0.22, 0.042, 0.048],
-      [ 0.14, -0.21, 0.045, 0.052],
-      [ 0.38, -0.18, 0.040, 0.045],
-      // Middle row (4 dots, more teardrop-shaped, taller ovals)
-      [-0.25,  0.00, 0.048, 0.072],
-      [-0.02, -0.02, 0.045, 0.068],
-      [ 0.22,  0.00, 0.050, 0.075],
-      [ 0.40,  0.04, 0.042, 0.058],
-      // Bottom row (3 dots, tear-drop ovals, more elongated vertically)
-      [-0.13,  0.16, 0.048, 0.075],
-      [ 0.08,  0.18, 0.050, 0.080],
-      [ 0.28,  0.16, 0.042, 0.062],
-    ];
-    for (const [xR, yR, rxR, ryR] of dots) {
-      ctx.beginPath();
-      ctx.ellipse(xR * r, yR * r, rxR * r, ryR * r, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
     ctx.restore();
   }
 }

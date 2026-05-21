@@ -24,7 +24,7 @@ function easeInOutSine(t: number): number {
   return -(Math.cos(Math.PI * t) - 1) / 2;
 }
 
-interface Particle {
+export interface Particle {
   x: number; y: number;
   vx: number; vy: number;
   life: number;
@@ -33,6 +33,32 @@ interface Particle {
   isLine: boolean;
   angle: number;
   kind: 'inhale' | 'exhale';
+  // Spawn position at the time the particle was created. Used by tests to
+  // verify exhale particles only spawn inside the mouth sprite disc.
+  spawnX: number; spawnY: number;
+  // Target position the particle is headed toward (inhale only — the chosen
+  // nostril). Exhale particles don't have a target.
+  targetX?: number; targetY?: number;
+  // Snapshot of the relevant face metrics AT SPAWN TIME. Stored so tests can
+  // compare against the geometry the spawner actually used, rather than the
+  // current frame's geometry (which differs because scale changes over time).
+  spawnLeftNoseX?: number;
+  spawnRightNoseX?: number;
+  spawnNoseY?: number;
+  spawnMouthCX?: number;
+  spawnMouthCY?: number;
+  spawnMouthR?: number;
+}
+
+// Snapshot of fish geometry, returned by getFishMetrics(). Tests use this to
+// know where the mouth sprite and nostrils are in screen space without
+// reaching into private state.
+export interface FishMetrics {
+  fishX: number; fishY: number;
+  baseR: number; scale: number;
+  scaledR: number;
+  leftNostrilX: number; rightNostrilX: number; nostrilY: number;
+  mouthCX: number; mouthCY: number; mouthR: number;
 }
 
 export class BreathingManager {
@@ -46,6 +72,7 @@ export class BreathingManager {
   private cssH = 1;
   private particles: Particle[] = [];
   private idleT = 0;
+  private _metrics: FishMetrics | null = null;
 
   // Tap-and-hold breath state
   private breathState: BreathState = 'idle';
@@ -54,6 +81,41 @@ export class BreathingManager {
 
   getScreen(): Screen { return this.screen; }
   getBreathState(): BreathState { return this.breathState; }
+
+  // Read-only access for tests. Returns a snapshot of live particle state
+  // including each particle's spawnX/Y and (for inhale) targetX/Y.
+  getParticles(): Particle[] {
+    return this.particles.map(p => ({ ...p }));
+  }
+
+  // Most recent fish metrics from the last rendered frame, or null if the
+  // breathing screen has not rendered yet. Tests use this to verify spawn
+  // points lie within the mouth disc and inhale targets equal a nostril.
+  getFishMetrics(): FishMetrics | null {
+    return this._metrics ? { ...this._metrics } : null;
+  }
+
+  // Compute the screen-space positions of the nostrils and the mouth sprite
+  // for the current frame. PufferFish.ts defines:
+  //   NOSE_Y     = -hr * 0.52  (nostril row)
+  //   BIG_NOSE_Y = -hr * 0.38  (Mouth_Circle center during exhale)
+  //   Mouth_Circle width = hr * 0.38  → radius = hr * 0.19
+  //   Nose_Open width = hr * 0.30 → dots at ±0.14 of asset-center
+  private computeMetrics(
+    fishX: number, fishY: number,
+    baseR: number, scale: number,
+  ): FishMetrics {
+    const scaledR = baseR * scale;
+    return {
+      fishX, fishY, baseR, scale, scaledR,
+      leftNostrilX:  fishX + (-baseR * 0.14) * scale,
+      rightNostrilX: fishX + ( baseR * 0.14) * scale,
+      nostrilY:      fishY + (-baseR * 0.52) * scale,
+      mouthCX:       fishX,
+      mouthCY:       fishY + (-baseR * 0.38) * scale,
+      mouthR:        baseR * 0.19 * scale,
+    };
+  }
 
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx  = canvas.getContext('2d')!;
@@ -87,60 +149,150 @@ export class BreathingManager {
   }
 
   // ── Particle system ────────────────────────────────────────────────────────
-
-  private spawnInhaleParticle(mouthX: number, mouthY: number, r: number): void {
+  // Phase-aware comet particles:
+  //   • INHALE: spawn outside body, velocity directed TOWARD the NEAREST
+  //             NOSTRIL (Nose_Open dot at ±0.14*baseR, NOSE_Y = -0.52*baseR).
+  //             Particles on the left of the fish flow to the left nostril
+  //             and vice versa, picked by Euclidean distance. Speed/decay
+  //             are tuned so the head physically reaches the nostril at
+  //             end-of-life.
+  //   • EXHALE: spawn AT a uniform random point inside the mouth sprite
+  //             disc (Mouth_Circle at -0.38*baseR, radius 0.19*baseR).
+  //             Velocity is RADIAL OUTWARD from the mouth center with a
+  //             small downward bias, so puffs radiate out of the mouth.
+  //             drawParticles runs AFTER fish.render so streaks stay in
+  //             front of the body.
+  //   • HOLD/IDLE: no new particles spawn; existing ones finish their motion.
+  private spawnInhaleParticle(
+    fishX: number,
+    fishY: number,
+    leftNostrilX: number,
+    rightNostrilX: number,
+    nostrilY: number,
+    r: number,
+  ): void {
     const angle = Math.random() * Math.PI * 2;
     const dist  = r * (1.25 + Math.random() * 0.55);
-    const x = mouthX + Math.cos(angle) * dist;
-    const y = mouthY + Math.sin(angle) * dist;
-    const speed = 180 + Math.random() * 80;
-    const dx = mouthX - x;
-    const dy = mouthY - y;
+    const x = fishX + Math.cos(angle) * dist;
+    const y = fishY + Math.sin(angle) * dist;
+    // Pick the NEAREST nostril by Euclidean distance — particles spawned
+    // anywhere around the fish flow to whichever nostril is closer.
+    const dLx = x - leftNostrilX,  dLy = y - nostrilY;
+    const dRx = x - rightNostrilX, dRy = y - nostrilY;
+    const distL2 = dLx * dLx + dLy * dLy;
+    const distR2 = dRx * dRx + dRy * dRy;
+    const targetX = distL2 < distR2 ? leftNostrilX : rightNostrilX;
+    const targetY = nostrilY;
+    const dx = targetX - x;
+    const dy = targetY - y;
     const norm = Math.hypot(dx, dy) || 1;
+    // The particle MUST physically arrive at the nostril before dying.
+    // Pick a random lifetime; set speed = distance / lifetime and decay =
+    // 1 / lifetime so the head reaches the target at exactly the moment its
+    // life hits 0. (Position at t=lifetime = spawn + velocity * lifetime
+    // = spawn + (target - spawn) = target.)
+    const lifetimeSec = 0.55 + Math.random() * 0.30;   // 0.55..0.85s
+    const speed = norm / lifetimeSec;
+    const decay = 1 / lifetimeSec;
     this.particles.push({
       x, y,
       vx: (dx / norm) * speed,
       vy: (dy / norm) * speed,
       life: 1,
-      decay: 0.9 + Math.random() * 0.3,
-      size: 1.5,
-      isLine: true,
+      decay,
+      // Reference p_008 shows comet trails: a small bright head and a LONG
+      // thicker fading tail (like shooting stars). `size` here is the HEAD dot
+      // radius. The long tail is drawn in drawParticles using a gradient line
+      // aligned with velocity.
+      size: 2.6 + Math.random() * 0.8,
+      isLine: false,
       angle: 0,
       kind: 'inhale',
+      spawnX: x, spawnY: y,
+      targetX, targetY,
+      spawnLeftNoseX:  leftNostrilX,
+      spawnRightNoseX: rightNostrilX,
+      spawnNoseY:      nostrilY,
     });
   }
 
-  private spawnExhaleParticle(mouthX: number, mouthY: number, _r: number): void {
-    const baseDeg = 90;
-    const spreadDeg = 50;
-    const deg = baseDeg + (Math.random() * 2 - 1) * spreadDeg;
-    const angle = deg * Math.PI / 180;
-    const speed = 150 + Math.random() * 90;
+  // Exhale particles spawn at a random point WITHIN the mouth sprite disc
+  // (Mouth_Circle, drawn at BIG_NOSE_Y = -0.38*baseR with width hr*0.38, so
+  // radius = 0.19*baseR). Velocity is RADIAL OUTWARD from the mouth center
+  // with a small downward bias.
+  private spawnExhaleParticle(
+    mouthCX: number,
+    mouthCY: number,
+    mouthR: number,
+  ): void {
+    // Uniform point in disc: sqrt(uniform) gives even areal density.
+    const ang0 = Math.random() * Math.PI * 2;
+    const rad0 = Math.sqrt(Math.random()) * mouthR;
+    const sx = mouthCX + Math.cos(ang0) * rad0;
+    const sy = mouthCY + Math.sin(ang0) * rad0;
+    // Velocity = radial outward from mouth center, biased downward so the
+    // overall flow still reads as "exhaling toward the floor". If the spawn
+    // landed exactly at the center, pick a random outward angle.
+    let dirX: number, dirY: number;
+    if (rad0 < 1e-3) {
+      const a = Math.random() * Math.PI * 2;
+      dirX = Math.cos(a);
+      dirY = Math.sin(a);
+    } else {
+      const norm = Math.hypot(sx - mouthCX, sy - mouthCY) || 1;
+      dirX = (sx - mouthCX) / norm;
+      dirY = (sy - mouthCY) / norm;
+    }
+    // Add a small downward bias to the radial direction. Re-normalize.
+    dirY += 0.35;
+    const n2 = Math.hypot(dirX, dirY) || 1;
+    dirX /= n2; dirY /= n2;
+    const speed = 140 + Math.random() * 80;
     this.particles.push({
-      x: mouthX + (Math.random() - 0.5) * 4,
-      y: mouthY + (Math.random() - 0.5) * 4,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
+      x: sx, y: sy,
+      vx: dirX * speed,
+      vy: dirY * speed,
       life: 1,
       decay: 0.9 + Math.random() * 0.3,
-      size: 1.5,
-      isLine: true,
+      // Comet trail — small bright head, long fading tail drawn in
+      // drawParticles. `size` is the HEAD dot radius only.
+      size: 2.2 + Math.random() * 0.7,
+      isLine: false,
       angle: 0,
       kind: 'exhale',
+      spawnX: sx, spawnY: sy,
+      spawnMouthCX: mouthCX,
+      spawnMouthCY: mouthCY,
+      spawnMouthR:  mouthR,
     });
   }
 
   private updateParticles(
     dt: number,
     phase: BreathPhase,
-    mouthX: number,
-    mouthY: number,
+    fishX: number,
+    fishY: number,
+    leftNostrilX: number,
+    rightNostrilX: number,
+    nostrilY: number,
+    mouthCX: number,
+    mouthCY: number,
+    mouthR: number,
     r: number,
   ): void {
     if (phase === 'inhale') {
-      if (Math.random() < dt * 20) this.spawnInhaleParticle(mouthX, mouthY, r);
+      // Inhale particles converge ON the nostrils (Nose_Open dots), high on
+      // the face. Each particle targets the CLOSEST nostril by Euclidean
+      // distance — particles on the left half flow to the left nostril and
+      // vice versa, but the choice is by true distance, not just side.
+      if (Math.random() < dt * 25) {
+        this.spawnInhaleParticle(fishX, fishY, leftNostrilX, rightNostrilX, nostrilY, r);
+      }
     } else if (phase === 'exhale') {
-      if (Math.random() < dt * 30) this.spawnExhaleParticle(mouthX, mouthY, r);
+      // Spawn WITHIN the mouth sprite disc (Mouth_Circle at -0.38*baseR with
+      // radius hr*0.19). Velocity radiates OUTWARD from the mouth center
+      // with a slight downward bias.
+      if (Math.random() < dt * 18) this.spawnExhaleParticle(mouthCX, mouthCY, mouthR);
     }
 
     const keep: Particle[] = [];
@@ -154,32 +306,47 @@ export class BreathingManager {
   }
 
   private drawParticles(ctx: CanvasRenderingContext2D): void {
-    const trailLen = 0.14;
+    // Reference p_008 (Breathe In) shows COMET TRAILS: a small bright head
+    // followed by a LONG fading tail (like shooting stars). Each particle
+    // renders as a gradient stroke head→tail plus a small bright dot at
+    // the head.
+    const trailLen = 0.35;
     for (const p of this.particles) {
+      const a = Math.max(0, Math.min(1, p.life));
+      const speed = Math.hypot(p.vx, p.vy);
+      if (speed < 1) continue;
+
+      // Tail end = position - velocity * trailLen. The tail is BEHIND the
+      // particle (opposite of motion direction). For inhale this points
+      // outward toward where the particle spawned; for exhale this points
+      // back toward the nose.
       const tailX = p.x - p.vx * trailLen;
       const tailY = p.y - p.vy * trailLen;
-      const a = Math.max(0, Math.min(1, p.life));
-      const headColor   = '#FFFFFF';
-      const streakColor = p.kind === 'exhale' ? '255,255,255' : '204,250,255';
 
       ctx.save();
-      const grad = ctx.createLinearGradient(tailX, tailY, p.x, p.y);
-      grad.addColorStop(0,   `rgba(${streakColor},0)`);
-      grad.addColorStop(0.6, `rgba(${streakColor},${a * 0.65})`);
-      grad.addColorStop(1,   `rgba(${streakColor},${a * 0.98})`);
+
+      // Gradient stroke from bright head → transparent tail end. Head alpha
+      // bumped to 0.95 so the leading edge of each trail reads brightly against
+      // the dark sky. Line width bumped from 2.5 → 4.5 to match the visibly
+      // THICK trails in reference p_008 (no longer hairline-thin).
+      const grad = ctx.createLinearGradient(p.x, p.y, tailX, tailY);
+      grad.addColorStop(0,    `rgba(216, 244, 255, ${a * 0.95})`);
+      grad.addColorStop(0.25, `rgba(216, 244, 255, ${a * 0.55})`);
+      grad.addColorStop(1,    `rgba(216, 244, 255, 0)`);
       ctx.strokeStyle = grad;
       ctx.lineCap = 'round';
-      ctx.lineWidth = p.kind === 'exhale' ? 2.6 : 2.2;
+      ctx.lineWidth = 6.5;
       ctx.beginPath();
-      ctx.moveTo(tailX, tailY);
-      ctx.lineTo(p.x, p.y);
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(tailX, tailY);
       ctx.stroke();
 
-      ctx.globalAlpha = a;
-      ctx.fillStyle = headColor;
+      // Bright dot at the head for the particle itself.
+      ctx.fillStyle = `rgba(255, 255, 255, ${a * 0.95})`;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.kind === 'exhale' ? 2.4 : 2.0, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, 3.2, 0, Math.PI * 2);
       ctx.fill();
+
       ctx.restore();
     }
   }
@@ -279,7 +446,7 @@ export class BreathingManager {
     const { ctx, cssW: W, cssH: H } = this;
 
     const idleScale = 0.92 + Math.sin(t * 0.8) * 0.04;
-    const r = Math.min(W, H) * 0.30;
+    const r = Math.min(W, H) * 0.26;
     const fishX = W / 2;
     const fishY = H * 0.40;
 
@@ -341,13 +508,32 @@ export class BreathingManager {
     const eased = easeInOutSine(this.breathProgress);
     const scale = SCALE_MIN + eased * (SCALE_MAX - SCALE_MIN);
 
-    const r     = Math.min(W, H) * 0.46;
+    // baseR is the silhouette radius unit. With a single ellipse silhouette
+    // (sx=1.05*baseR, sy=1.02*baseR, bottom slightly fuller), the silhouette
+    // is ~2.10*baseR wide and ~2.04*baseR tall before scale. At scale=1.22
+    // that's ~2.56*baseR wide and ~2.49*baseR tall. Reference frames show
+    // the fish filling ~85-87% of viewport width at peak inflation.
+    //   On 540×960:  baseR = 540 * 0.34 ≈ 184 → full-width@1.22 ≈ 470px
+    //   (~87% of 540), full-height@1.22 ≈ 448px. Centred at H*0.48.
+    const r     = Math.min(W, H) * 0.34;
     const fishX = W / 2;
-    const fishY = H * 0.50;
+    const fishY = H * 0.48;
 
+    // Background paints the gradient sky and a soft localized halo behind
+    // the fish. The PufferFish sprite layer also draws Glow.png directly,
+    // so the two layers together produce the bloom.
     this.drawBackground(ctx, W, H, fishX, fishY, r * scale);
-    const mouthY = fishY + (-r * 0.61) * scale;
-    this.updateParticles(dt, phase, fishX, mouthY, r * scale);
+    // Cache metrics so getFishMetrics() can return the same numbers we use
+    // for spawning. This is read by Playwright tests to verify behavior.
+    this._metrics = this.computeMetrics(fishX, fishY, r, scale);
+    const m = this._metrics;
+    this.updateParticles(
+      dt, phase,
+      fishX, fishY,
+      m.leftNostrilX, m.rightNostrilX, m.nostrilY,
+      m.mouthCX, m.mouthCY, m.mouthR,
+      r * scale,
+    );
     this.fish.render(ctx, fishX, fishY, r, scale, phase, phaseT);
     this.drawParticles(ctx);
 
