@@ -57,32 +57,42 @@ test.describe('Pufferfish Breathing App', () => {
     expect(await getScreen(page)).toBe('breathing');
   });
 
-  test('pufferfish animates during breathing — canvas changes over time', async ({ page }) => {
+  test('pressing and holding inflates the pufferfish; releasing deflates it', async ({ page }) => {
     await page.goto('/');
     await page.waitForLoadState('networkidle');
-    // Start breathing
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
+    // Enter breathing screen.
     await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
-    await page.waitForTimeout(200);
-    // Capture pixel hash at t=0 and t=500ms — they must differ (fish is scaling)
-    const snapshot1 = await page.evaluate(() => {
-      const c = document.getElementById('canvas') as HTMLCanvasElement;
-      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
-      let sum = 0;
-      for (let i = 0; i < d.length; i += 16) sum += d[i];
-      return sum;
+    await page.waitForTimeout(150);
+    expect(await getScreen(page)).toBe('breathing');
+
+    // Idle: no breath progress, state should be 'idle'.
+    const idleState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
     });
-    await page.waitForTimeout(500);
-    const snapshot2 = await page.evaluate(() => {
-      const c = document.getElementById('canvas') as HTMLCanvasElement;
-      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
-      let sum = 0;
-      for (let i = 0; i < d.length; i += 16) sum += d[i];
-      return sum;
+    expect(idleState).toBe('idle');
+
+    // Press and hold — should transition to inhaling.
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(400);
+    const inhalingState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
     });
-    expect(snapshot1).not.toBe(snapshot2);
+    expect(inhalingState).toBe('inhaling');
+
+    // Release — should transition to exhaling.
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const exhalingState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
+    });
+    expect(exhalingState).toBe('exhaling');
   });
 
   test('timer expiring returns to start screen', async ({ page }) => {
