@@ -1,6 +1,6 @@
 {
   "name": "FA_Pufferfish",
-  "image": "mcr.microsoft.com/playwright:v1.44.0-jammy",
+  "image": "mcr.microsoft.com/playwright:v1.60.0-jammy",
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
       "version": "20"

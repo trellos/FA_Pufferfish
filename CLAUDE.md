@@ -72,7 +72,7 @@ To enable: in the repo's GitHub Settings → Pages, set **Source = GitHub Action
   `playwright.config.ts`, so they work without a display server.
 - `playwright.config.ts` sets `reuseExistingServer: !process.env.CI`, so in CI /
   cloud the dev server is freshly spawned per run and torn down after.
-- The Playwright base image (`mcr.microsoft.com/playwright:v1.44.0-jammy`) used by
+- The Playwright base image (`mcr.microsoft.com/playwright:v1.60.0-jammy`) used by
   the devcontainer already has every system lib Chromium needs — the
   `--with-deps` step in `setup.sh` is a no-op there.
 - All PNG assets the app needs at runtime live in `public/assets/` and are
