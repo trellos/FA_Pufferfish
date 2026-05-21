@@ -101,4 +101,134 @@ test.describe('Pufferfish Breathing App', () => {
     expect(await getScreen(page)).toBe('start');
   });
 
+  // ── Particle behavior tests ──────────────────────────────────────────────
+  // These verify the user-specified contracts on the particle system:
+  //   • Every inhale particle has a target that equals one of the two nostril
+  //     positions (the particle is heading to a nostril).
+  //   • Every exhale particle spawns within the mouth sprite disc.
+
+  test('breathe-in particles target a nostril', async ({ page }) => {
+    // Long inhale phase so we have plenty of particles to inspect.
+    // 20s cycle → 8s inhale, 2s hold, 10s exhale.
+    await page.goto('/?cycle=20&duration=60');
+    await page.waitForLoadState('networkidle');
+    // Start breathing programmatically (avoids depending on play-button hit box)
+    await page.evaluate(() => {
+      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
+      m.startBreathing();
+    });
+    // Wait into the inhale phase so particles spawn
+    await page.waitForTimeout(1200);
+
+    const result = await page.evaluate(() => {
+      type P = {
+        kind: 'inhale' | 'exhale';
+        targetX?: number; targetY?: number;
+        spawnLeftNoseX?: number; spawnRightNoseX?: number; spawnNoseY?: number;
+      };
+      const mgr = (window as unknown as {
+        __breathingManager: { getParticles: () => P[] };
+      }).__breathingManager;
+      const particles = mgr.getParticles().filter(p => p.kind === 'inhale');
+      return { particles };
+    });
+
+    expect(result.particles.length).toBeGreaterThan(0);
+    for (const p of result.particles) {
+      // Every inhale particle must have a target and remember which nostril
+      // positions it was given at spawn.
+      expect(p.targetX).not.toBeUndefined();
+      expect(p.targetY).not.toBeUndefined();
+      expect(p.spawnLeftNoseX).not.toBeUndefined();
+      expect(p.spawnRightNoseX).not.toBeUndefined();
+      expect(p.spawnNoseY).not.toBeUndefined();
+      // The target Y must equal the nostril row from the SAME frame as spawn.
+      expect(p.targetY!).toBe(p.spawnNoseY!);
+      // The target X must equal EITHER the left or right nostril X from spawn.
+      const onLeft  = p.targetX! === p.spawnLeftNoseX!;
+      const onRight = p.targetX! === p.spawnRightNoseX!;
+      expect(onLeft || onRight).toBe(true);
+    }
+  });
+
+  test('breathe-in particles physically reach their target nostril', async ({ page }) => {
+    // Verify the trajectory math: at end of life (life=0), the particle's
+    // position should equal its target. With speed = distance / lifetime and
+    // decay = 1 / lifetime, position at t=lifetime = target.
+    await page.goto('/?cycle=20&duration=60');
+    await page.waitForLoadState('networkidle');
+    await page.evaluate(() => {
+      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
+      m.startBreathing();
+    });
+    await page.waitForTimeout(1500);
+
+    const result = await page.evaluate(() => {
+      type P = {
+        kind: 'inhale' | 'exhale';
+        x: number; y: number;
+        vx: number; vy: number;
+        life: number; decay: number;
+        targetX?: number; targetY?: number;
+      };
+      const mgr = (window as unknown as {
+        __breathingManager: { getParticles: () => P[] };
+      }).__breathingManager;
+      const particles = mgr.getParticles().filter(p => p.kind === 'inhale');
+      return { particles };
+    });
+
+    expect(result.particles.length).toBeGreaterThan(0);
+    for (const p of result.particles) {
+      // Compute remaining time until life hits 0: life / decay (seconds).
+      const remaining = p.life / p.decay;
+      // Predict the particle's position at end-of-life.
+      const endX = p.x + p.vx * remaining;
+      const endY = p.y + p.vy * remaining;
+      // The predicted end position must be the target (within tiny float error).
+      expect(Math.hypot(endX - p.targetX!, endY - p.targetY!)).toBeLessThan(0.5);
+    }
+  });
+
+  test('breathe-out particles only spawn within the mouth sprite disc', async ({ page }) => {
+    // Long cycle so the exhale phase is generous. 20s cycle: inhale 0-8s,
+    // hold 8-10s, exhale 10-20s. We sample mid-exhale at ~13s elapsed.
+    await page.goto('/?cycle=20&duration=60');
+    await page.waitForLoadState('networkidle');
+    await page.evaluate(() => {
+      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
+      m.startBreathing();
+    });
+    // Wait into the exhale phase (10s into cycle + 1.5s margin to spawn).
+    await page.waitForTimeout(11500);
+
+    const result = await page.evaluate(() => {
+      type P = {
+        kind: 'inhale' | 'exhale';
+        spawnX: number; spawnY: number;
+        spawnMouthCX?: number; spawnMouthCY?: number; spawnMouthR?: number;
+      };
+      const mgr = (window as unknown as {
+        __breathingManager: { getParticles: () => P[] };
+      }).__breathingManager;
+      const particles = mgr.getParticles().filter(p => p.kind === 'exhale');
+      return { particles };
+    });
+
+    expect(result.particles.length).toBeGreaterThan(0);
+    for (const p of result.particles) {
+      // Each exhale particle remembers the mouth disc it was spawned in.
+      expect(p.spawnMouthCX).not.toBeUndefined();
+      expect(p.spawnMouthCY).not.toBeUndefined();
+      expect(p.spawnMouthR).not.toBeUndefined();
+      const dx = p.spawnX - p.spawnMouthCX!;
+      const dy = p.spawnY - p.spawnMouthCY!;
+      const dist = Math.hypot(dx, dy);
+      // The spawn point must lie inside the mouth sprite disc.
+      // Tiny floating-point slack (1e-6) is allowed; the spawn function uses
+      // sqrt(random) * mouthR so dist is at most mouthR exactly.
+      expect(dist).toBeLessThanOrEqual(p.spawnMouthR! + 1e-6);
+    }
+  });
+
 });
