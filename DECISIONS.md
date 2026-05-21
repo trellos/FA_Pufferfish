@@ -96,3 +96,24 @@ so Playwright tests can read the current screen without screenshot comparison.
 **Rationale:** All rendering is canvas-based (no DOM text to query), so the cleanest
 test interface is a direct JS property. This is a non-production concern — only useful
 for automated tests.
+
+---
+
+## 10. Tap-and-hold breath control (supersedes auto-cycle in §?)
+
+**Decision:** On the breathing screen the pufferfish no longer runs an automatic
+inhale/hold/exhale cycle. Instead, the user presses the screen to inhale and
+releases to exhale.
+
+- Idle (min size): top bar reads "tap to breathe in".
+- Pressing: state = inhaling, scale grows from min → max over 5s. Bar reads
+  "hold to breathe in" and fills from both sides toward the center.
+- After 5s held: state = holding, scale pinned at max. Bar reads "holding".
+- Release: state = exhaling. Scale shrinks back to min at the same rate as the
+  inhale, so a partial inhale exhales in the same time it inhaled (capped at 5s).
+  Bar text is blank while the fill retreats back to the sides.
+- The `?cycle` URL param is removed; `?duration` (session length) is retained.
+
+**Rationale:** Gives the child direct control over their breath rather than
+forcing them to follow a fixed tempo. The fill-from-sides bar gives a
+non-numeric visual cue of how full the breath is.

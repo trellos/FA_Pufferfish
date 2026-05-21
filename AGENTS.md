@@ -44,9 +44,11 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-URL parameters (both optional):
-- `?cycle=8`      — seconds per full breath cycle (default 8)
+URL parameters (optional):
 - `?duration=60`  — total session length in seconds (default 60)
+
+The pufferfish is tap-and-hold driven: hold to inhale (max in 5s), release to
+exhale (same duration as the inhale, capped at 5s). See DECISIONS.md §10.
 
 ---
 

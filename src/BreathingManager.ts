@@ -1,9 +1,17 @@
-// BreathingManager — screen flow, timing, rAF loop, particles, UI.
-// URL params: ?cycle=8 (seconds per full breath cycle) ?duration=60 (session length)
+// BreathingManager — screen flow, tap-and-hold breath control, rAF loop, particles, UI.
+// URL params: ?duration=60 (session length in seconds)
 
 import { PufferFish, BreathPhase } from './PufferFish';
 
 type Screen = 'start' | 'breathing';
+type BreathState = 'idle' | 'inhaling' | 'holding' | 'exhaling';
+
+// Seconds to go from min → max scale while held. Exhale uses the same rate,
+// so partial inhales exhale in the same time they inhaled.
+const FULL_BREATH_SECS = 5;
+
+const SCALE_MIN = 0.78;
+const SCALE_MAX = 1.22;
 
 function urlNum(key: string, fallback: number): number {
   const v = new URLSearchParams(window.location.search).get(key);
@@ -19,8 +27,8 @@ function easeInOutSine(t: number): number {
 export interface Particle {
   x: number; y: number;
   vx: number; vy: number;
-  life: number;       // 0–1
-  decay: number;      // per second
+  life: number;
+  decay: number;
   size: number;
   isLine: boolean;
   angle: number;
@@ -57,7 +65,6 @@ export class BreathingManager {
   private ctx: CanvasRenderingContext2D;
   private fish: PufferFish;
   private screen: Screen = 'start';
-  private cycleSecs: number;
   private sessionSecs: number;
   sessionStart = 0;
   private dpr = 1;
@@ -67,7 +74,13 @@ export class BreathingManager {
   private idleT = 0;
   private _metrics: FishMetrics | null = null;
 
+  // Tap-and-hold breath state
+  private breathState: BreathState = 'idle';
+  private pressed = false;
+  private breathProgress = 0; // 0 = min scale, 1 = max scale
+
   getScreen(): Screen { return this.screen; }
+  getBreathState(): BreathState { return this.breathState; }
 
   // Read-only access for tests. Returns a snapshot of live particle state
   // including each particle's spawnX/Y and (for inhale) targetX/Y.
@@ -107,7 +120,6 @@ export class BreathingManager {
   constructor(private canvas: HTMLCanvasElement) {
     this.ctx  = canvas.getContext('2d')!;
     this.fish = new PufferFish(`${import.meta.env.BASE_URL}assets/`);
-    this.cycleSecs   = urlNum('cycle',    8);
     this.sessionSecs = urlNum('duration', 60);
   }
 
@@ -128,30 +140,29 @@ export class BreathingManager {
   }
 
   startBreathing(): void {
-    this.screen       = 'breathing';
-    this.sessionStart = performance.now();
-    this.particles    = [];
+    this.screen         = 'breathing';
+    this.sessionStart   = performance.now();
+    this.particles      = [];
+    this.breathState    = 'idle';
+    this.breathProgress = 0;
+    this.pressed        = false;
   }
 
   // ── Particle system ────────────────────────────────────────────────────────
   // Phase-aware comet particles:
-  //   • INHALE: spawn outside body, velocity directed TOWARD the SPECIFIC
-  //             NOSTRIL on the same side as the spawn point. Particles on the
-  //             LEFT of the fish target the LEFT nostril (Nose_Open dot at
-  //             -0.14*r); particles on the RIGHT target the RIGHT nostril
-  //             (+0.14*r). Tail (motion blur) points away from the nostril
-  //             (toward spawn origin), giving "breath drawn IN" feel.
-  //   • EXHALE: spawn AT the MOUTH position (just below the big central nose,
-  //             at y = -0.20*r) so puffs read as BREATH coming OUT of the
-  //             fish's mouth. Velocity is a WIDE fan (±110° cone around +Y)
-  //             so particles radiate LEFT/DOWN-LEFT/DOWN/DOWN-RIGHT/RIGHT but
-  //             never straight up. drawParticles runs AFTER fish.render, so
-  //             the streaks stay visible in FRONT of the body.
-  //   • HOLD:   no new particles spawn; existing ones finish their motion.
-  //
-  // Inhale spawn: pick a random angle/distance around the fish center, decide
-  // which side of the fish the spawn is on, then aim velocity at the LEFT
-  // nostril (if spawnX < fishX) or RIGHT nostril (if spawnX >= fishX).
+  //   • INHALE: spawn outside body, velocity directed TOWARD the NEAREST
+  //             NOSTRIL (Nose_Open dot at ±0.14*baseR, NOSE_Y = -0.52*baseR).
+  //             Particles on the left of the fish flow to the left nostril
+  //             and vice versa, picked by Euclidean distance. Speed/decay
+  //             are tuned so the head physically reaches the nostril at
+  //             end-of-life.
+  //   • EXHALE: spawn AT a uniform random point inside the mouth sprite
+  //             disc (Mouth_Circle at -0.38*baseR, radius 0.19*baseR).
+  //             Velocity is RADIAL OUTWARD from the mouth center with a
+  //             small downward bias, so puffs radiate out of the mouth.
+  //             drawParticles runs AFTER fish.render so streaks stay in
+  //             front of the body.
+  //   • HOLD/IDLE: no new particles spawn; existing ones finish their motion.
   private spawnInhaleParticle(
     fishX: number,
     fishY: number,
@@ -207,8 +218,8 @@ export class BreathingManager {
 
   // Exhale particles spawn at a random point WITHIN the mouth sprite disc
   // (Mouth_Circle, drawn at BIG_NOSE_Y = -0.38*baseR with width hr*0.38, so
-  // radius = 0.19*baseR). Velocity is RADIAL OUTWARD from the mouth center,
-  // making puffs read as breath radiating from every part of the mouth.
+  // radius = 0.19*baseR). Velocity is RADIAL OUTWARD from the mouth center
+  // with a small downward bias.
   private spawnExhaleParticle(
     mouthCX: number,
     mouthCY: number,
@@ -232,8 +243,7 @@ export class BreathingManager {
       dirX = (sx - mouthCX) / norm;
       dirY = (sy - mouthCY) / norm;
     }
-    // Add a small downward bias to the radial direction (so the fan tilts
-    // toward the floor rather than being a perfect sunburst). Re-normalize.
+    // Add a small downward bias to the radial direction. Re-normalize.
     dirY += 0.35;
     const n2 = Math.hypot(dirX, dirY) || 1;
     dirX /= n2; dirY /= n2;
@@ -284,7 +294,6 @@ export class BreathingManager {
       // with a slight downward bias.
       if (Math.random() < dt * 18) this.spawnExhaleParticle(mouthCX, mouthCY, mouthR);
     }
-    // 'hold' — no spawn, existing particles continue moving.
 
     const keep: Particle[] = [];
     for (const p of this.particles) {
@@ -298,13 +307,9 @@ export class BreathingManager {
 
   private drawParticles(ctx: CanvasRenderingContext2D): void {
     // Reference p_008 (Breathe In) shows COMET TRAILS: a small bright head
-    // followed by a LONG thin fading tail (like shooting stars). The tail
-    // extends BEHIND the particle (opposite of velocity) and fades from
-    // bright cyan-white at the head to fully transparent at the tail end.
-    //
-    // Each particle is rendered as:
-    //   1. A single line streak with a gradient stroke (head→tail fade).
-    //   2. A tiny bright dot at the head for the "particle" itself.
+    // followed by a LONG fading tail (like shooting stars). Each particle
+    // renders as a gradient stroke head→tail plus a small bright dot at
+    // the head.
     const trailLen = 0.35;
     for (const p of this.particles) {
       const a = Math.max(0, Math.min(1, p.life));
@@ -353,9 +358,6 @@ export class BreathingManager {
     W: number, H: number,
     glowX?: number, glowY?: number, glowR?: number,
   ): void {
-    // Reference frame_015 sampled (1080×1920):
-    //   top edge:    rgb(25,63,126)  ≈ #193F7E
-    //   bottom edge: rgb(58,123,224) ≈ #3A7BE0
     const bg = ctx.createLinearGradient(0, 0, 0, H);
     bg.addColorStop(0, '#193F7E');
     bg.addColorStop(1, '#3A7BE0');
@@ -363,9 +365,6 @@ export class BreathingManager {
     ctx.fillRect(0, 0, W, H);
 
     if (glowX !== undefined && glowY !== undefined && glowR !== undefined) {
-      // Soft halo localized to fish edge — uses lighter blend mode to avoid
-      // washing out the body's dark belt color (the screen blend at high alpha
-      // was making rgb(21,159,221) appear as rgb(21,249,255)).
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       const r2 = glowR * 1.45;
@@ -380,7 +379,6 @@ export class BreathingManager {
       ctx.restore();
     }
   }
-
 
   // ── Loop ──────────────────────────────────────────────────────────────────
 
@@ -397,13 +395,48 @@ export class BreathingManager {
     } else {
       const elapsed = (ts - this.sessionStart) / 1000;
       if (elapsed >= this.sessionSecs) {
-        this.screen = 'start';
-        this.idleT  = 0;
-        this.particles = [];
+        this.screen        = 'start';
+        this.idleT         = 0;
+        this.particles     = [];
+        this.breathState   = 'idle';
+        this.breathProgress = 0;
+        this.pressed       = false;
         this.drawStart(0);
         return;
       }
-      this.drawBreathing(elapsed, dt);
+      this.advanceBreath(dt);
+      this.drawBreathing(dt);
+    }
+  }
+
+  // ── Breath state machine ──────────────────────────────────────────────────
+
+  private advanceBreath(dt: number): void {
+    const rate = 1 / FULL_BREATH_SECS; // progress units per second
+
+    if (this.pressed) {
+      if (this.breathState === 'idle' || this.breathState === 'exhaling') {
+        this.breathState = 'inhaling';
+      }
+      if (this.breathState === 'inhaling') {
+        this.breathProgress = Math.min(1, this.breathProgress + rate * dt);
+        if (this.breathProgress >= 1) {
+          this.breathProgress = 1;
+          this.breathState = 'holding';
+        }
+      }
+      // holding: progress stays at 1
+    } else {
+      if (this.breathState === 'inhaling' || this.breathState === 'holding') {
+        this.breathState = 'exhaling';
+      }
+      if (this.breathState === 'exhaling') {
+        this.breathProgress = Math.max(0, this.breathProgress - rate * dt);
+        if (this.breathProgress <= 0) {
+          this.breathProgress = 0;
+          this.breathState = 'idle';
+        }
+      }
     }
   }
 
@@ -420,7 +453,6 @@ export class BreathingManager {
     this.drawBackground(ctx, W, H, fishX, fishY, r * idleScale);
     this.fish.render(ctx, fishX, fishY, r, idleScale, 'exhale');
 
-    // Title
     const titleSz = Math.min(W * 0.115, 52);
     ctx.textAlign    = 'center';
     ctx.textBaseline = 'middle';
@@ -428,7 +460,6 @@ export class BreathingManager {
     ctx.font         = `${titleSz}px system-ui, -apple-system, sans-serif`;
     ctx.fillText('Breathe', W / 2, H * 0.74);
 
-    // Subtitle
     const subSz = Math.min(W * 0.043, 18);
     ctx.fillStyle = 'rgba(200,230,255,0.80)';
     ctx.font      = `${subSz}px system-ui, -apple-system, sans-serif`;
@@ -462,45 +493,36 @@ export class BreathingManager {
 
   // ── Breathing screen ──────────────────────────────────────────────────────
 
-  private drawBreathing(elapsed: number, dt: number): void {
+  private drawBreathing(dt: number): void {
     const { ctx, cssW: W, cssH: H } = this;
 
-    const cycleT     = (elapsed % this.cycleSecs) / this.cycleSecs;
-    const INHALE_END = 0.40;   // 40 % inhale
-    const HOLD_END   = 0.50;   // 10 % hold, 50 % exhale
+    const phase: BreathPhase =
+      this.breathState === 'inhaling' ? 'inhale' :
+      this.breathState === 'holding'  ? 'hold'   :
+      this.breathState === 'exhaling' ? 'exhale' :
+      /* idle */                        'exhale';
 
-    let phase: BreathPhase;
-    let phaseT: number;
-    let scale: number;
+    // PufferFish renderer uses phaseT for sub-phase asset swaps during inhale.
+    const phaseT = this.breathProgress;
 
-    if (cycleT < INHALE_END) {
-      phase  = 'inhale';
-      phaseT = cycleT / INHALE_END;
-      scale  = 0.78 + easeInOutSine(phaseT) * 0.44;
-    } else if (cycleT < HOLD_END) {
-      phase  = 'hold';
-      phaseT = (cycleT - INHALE_END) / (HOLD_END - INHALE_END);
-      scale  = 1.22;
-    } else {
-      phase  = 'exhale';
-      phaseT = (cycleT - HOLD_END) / (1 - HOLD_END);
-      scale  = 1.22 - easeInOutSine(phaseT) * 0.44;
-    }
+    const eased = easeInOutSine(this.breathProgress);
+    const scale = SCALE_MIN + eased * (SCALE_MAX - SCALE_MIN);
 
     // baseR is the silhouette radius unit. With a single ellipse silhouette
-    // (sx=1.05*baseR, sy=1.00*baseR, bottom slightly fuller), the silhouette
-    // is ~2.10*baseR wide and ~2.00*baseR tall before scale. At scale=1.22
-    // that's ~2.56*baseR wide and ~2.44*baseR tall. Reference frames show
+    // (sx=1.05*baseR, sy=1.02*baseR, bottom slightly fuller), the silhouette
+    // is ~2.10*baseR wide and ~2.04*baseR tall before scale. At scale=1.22
+    // that's ~2.56*baseR wide and ~2.49*baseR tall. Reference frames show
     // the fish filling ~85-87% of viewport width at peak inflation.
     //   On 540×960:  baseR = 540 * 0.34 ≈ 184 → full-width@1.22 ≈ 470px
-    //   (~87% of 540), full-height@1.22 ≈ 448px. Centred at H*0.50.
+    //   (~87% of 540), full-height@1.22 ≈ 448px. Centred at H*0.48.
     const r     = Math.min(W, H) * 0.34;
     const fishX = W / 2;
     const fishY = H * 0.48;
 
-    // Background draws only the gradient sky — no extra halo. The PufferFish
-    // sprite layer draws Glow.png directly, so the bloom is local to the fish.
-    this.drawBackground(ctx, W, H);
+    // Background paints the gradient sky and a soft localized halo behind
+    // the fish. The PufferFish sprite layer also draws Glow.png directly,
+    // so the two layers together produce the bloom.
+    this.drawBackground(ctx, W, H, fishX, fishY, r * scale);
     // Cache metrics so getFishMetrics() can return the same numbers we use
     // for spawning. This is read by Playwright tests to verify behavior.
     this._metrics = this.computeMetrics(fishX, fishY, r, scale);
@@ -513,47 +535,54 @@ export class BreathingManager {
       r * scale,
     );
     this.fish.render(ctx, fishX, fishY, r, scale, phase, phaseT);
-    // Particles drawn ON TOP of the fish so exhale streaks crossing the body
-    // remain visible (matches reference frame_020).
     this.drawParticles(ctx);
 
-    // Label: full alpha during inhale/hold; fades out in second half of exhale
-    const label = phase === 'inhale' ? 'Breathe In'
-                : phase === 'hold'   ? 'Hold'
-                : 'Breathe Out';
-    const textAlpha = phase !== 'exhale'  ? 1.0
-                    : phaseT < 0.5        ? 1.0
-                    : Math.max(0, 1.0 - (phaseT - 0.5) * 2.5);
-
-    const lblSz = Math.min(W * 0.115, 52);
-    ctx.save();
-    ctx.globalAlpha  = textAlpha;
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle    = '#FFFFFF';
-    ctx.font         = `300 ${lblSz}px system-ui, -apple-system, sans-serif`;
-    ctx.fillText(label, W / 2, H * 0.08);
-    ctx.restore();
-
-    const progress = 1 - elapsed / this.sessionSecs;
-    this.drawTimerBar(W / 2, H * 0.93, W * 0.55, 22, progress);
+    this.drawBreathBar(W / 2, H * 0.08, Math.min(W * 0.75, 520), 36, this.breathProgress);
   }
 
-  private drawTimerBar(cx: number, cy: number, width: number, h: number, progress: number): void {
+  // Top bar: fills from each side toward center; text changes per state.
+  private drawBreathBar(cx: number, cy: number, width: number, h: number, progress: number): void {
     const { ctx } = this;
     const rx = h / 2;
     const x  = cx - width / 2;
     const y  = cy - h / 2;
 
     ctx.save();
+
+    // Track
     ctx.fillStyle = 'rgba(10,20,60,0.7)';
     this.rrect(ctx, x, y, width, h, rx);
     ctx.fill();
 
-    const fillW = Math.max(width * progress, h);
-    ctx.fillStyle = '#00DDFF';
-    this.rrect(ctx, x, y, fillW, h, rx);
-    ctx.fill();
+    // Twin fill from each side toward center
+    if (progress > 0) {
+      const halfFill = (width / 2) * progress;
+      ctx.save();
+      this.rrect(ctx, x, y, width, h, rx);
+      ctx.clip();
+      ctx.fillStyle = '#FFB84D'; // distinct from the cyan play button & track
+      // Left half
+      ctx.fillRect(x, y, halfFill, h);
+      // Right half
+      ctx.fillRect(x + width - halfFill, y, halfFill, h);
+      ctx.restore();
+    }
+
+    // Text
+    const label =
+      this.breathState === 'inhaling' ? 'hold to breathe in' :
+      this.breathState === 'holding'  ? 'holding'            :
+      this.breathState === 'idle'     ? 'tap to breathe in'  :
+      /* exhaling */                    '';
+
+    if (label) {
+      const fs = Math.min(h * 0.52, 18);
+      ctx.fillStyle    = '#FFFFFF';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font         = `600 ${fs}px system-ui, -apple-system, sans-serif`;
+      ctx.fillText(label, cx, cy);
+    }
 
     ctx.restore();
   }
@@ -568,7 +597,7 @@ export class BreathingManager {
     ctx.closePath();
   }
 
-  // ── Hit testing ────────────────────────────────────────────────────────────
+  // ── Input ─────────────────────────────────────────────────────────────────
 
   handleClick(x: number, y: number): void {
     if (this.screen !== 'start') return;
@@ -578,5 +607,16 @@ export class BreathingManager {
     if (Math.hypot(x - bx, y - by) <= br * 1.3) {
       this.startBreathing();
     }
+  }
+
+  // Press/release drive the breath state machine on the breathing screen.
+  handlePressDown(): void {
+    if (this.screen !== 'breathing') return;
+    this.pressed = true;
+  }
+
+  handlePressUp(): void {
+    if (this.screen !== 'breathing') return;
+    this.pressed = false;
   }
 }

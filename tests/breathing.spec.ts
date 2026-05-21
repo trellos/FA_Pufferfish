@@ -57,32 +57,42 @@ test.describe('Pufferfish Breathing App', () => {
     expect(await getScreen(page)).toBe('breathing');
   });
 
-  test('pufferfish animates during breathing — canvas changes over time', async ({ page }) => {
+  test('pressing and holding inflates the pufferfish; releasing deflates it', async ({ page }) => {
     await page.goto('/');
     await page.waitForLoadState('networkidle');
-    // Start breathing
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
+    // Enter breathing screen.
     await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
-    await page.waitForTimeout(200);
-    // Capture pixel hash at t=0 and t=500ms — they must differ (fish is scaling)
-    const snapshot1 = await page.evaluate(() => {
-      const c = document.getElementById('canvas') as HTMLCanvasElement;
-      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
-      let sum = 0;
-      for (let i = 0; i < d.length; i += 16) sum += d[i];
-      return sum;
+    await page.waitForTimeout(150);
+    expect(await getScreen(page)).toBe('breathing');
+
+    // Idle: no breath progress, state should be 'idle'.
+    const idleState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
     });
-    await page.waitForTimeout(500);
-    const snapshot2 = await page.evaluate(() => {
-      const c = document.getElementById('canvas') as HTMLCanvasElement;
-      const d = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
-      let sum = 0;
-      for (let i = 0; i < d.length; i += 16) sum += d[i];
-      return sum;
+    expect(idleState).toBe('idle');
+
+    // Press and hold — should transition to inhaling.
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(400);
+    const inhalingState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
     });
-    expect(snapshot1).not.toBe(snapshot2);
+    expect(inhalingState).toBe('inhaling');
+
+    // Release — should transition to exhaling.
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const exhalingState = await page.evaluate(() => {
+      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+      return m.getBreathState();
+    });
+    expect(exhalingState).toBe('exhaling');
   });
 
   test('timer expiring returns to start screen', async ({ page }) => {
@@ -108,17 +118,19 @@ test.describe('Pufferfish Breathing App', () => {
   //   • Every exhale particle spawns within the mouth sprite disc.
 
   test('breathe-in particles target a nostril', async ({ page }) => {
-    // Long inhale phase so we have plenty of particles to inspect.
-    // 20s cycle → 8s inhale, 2s hold, 10s exhale.
-    await page.goto('/?cycle=20&duration=60');
+    await page.goto('/?duration=60');
     await page.waitForLoadState('networkidle');
-    // Start breathing programmatically (avoids depending on play-button hit box)
-    await page.evaluate(() => {
-      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
-      m.startBreathing();
-    });
-    // Wait into the inhale phase so particles spawn
-    await page.waitForTimeout(1200);
+    const canvas = page.locator('#canvas');
+    const box    = await canvas.boundingBox();
+    expect(box).not.toBeNull();
+    // Enter breathing screen via the play button.
+    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await page.waitForTimeout(150);
+    // Press and hold to drive the inhale state — particles only spawn while
+    // the breath state is 'inhaling'.
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(800);
 
     const result = await page.evaluate(() => {
       type P = {
@@ -149,19 +161,23 @@ test.describe('Pufferfish Breathing App', () => {
       const onRight = p.targetX! === p.spawnRightNoseX!;
       expect(onLeft || onRight).toBe(true);
     }
+    await page.mouse.up();
   });
 
   test('breathe-in particles physically reach their target nostril', async ({ page }) => {
     // Verify the trajectory math: at end of life (life=0), the particle's
     // position should equal its target. With speed = distance / lifetime and
     // decay = 1 / lifetime, position at t=lifetime = target.
-    await page.goto('/?cycle=20&duration=60');
+    await page.goto('/?duration=60');
     await page.waitForLoadState('networkidle');
-    await page.evaluate(() => {
-      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
-      m.startBreathing();
-    });
-    await page.waitForTimeout(1500);
+    const canvas = page.locator('#canvas');
+    const box    = await canvas.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await page.waitForTimeout(150);
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(800);
 
     const result = await page.evaluate(() => {
       type P = {
@@ -188,19 +204,25 @@ test.describe('Pufferfish Breathing App', () => {
       // The predicted end position must be the target (within tiny float error).
       expect(Math.hypot(endX - p.targetX!, endY - p.targetY!)).toBeLessThan(0.5);
     }
+    await page.mouse.up();
   });
 
   test('breathe-out particles only spawn within the mouth sprite disc', async ({ page }) => {
-    // Long cycle so the exhale phase is generous. 20s cycle: inhale 0-8s,
-    // hold 8-10s, exhale 10-20s. We sample mid-exhale at ~13s elapsed.
-    await page.goto('/?cycle=20&duration=60');
+    // Drive an inhale, then release to enter exhale and spawn exhale particles.
+    await page.goto('/?duration=60');
     await page.waitForLoadState('networkidle');
-    await page.evaluate(() => {
-      const m = (window as unknown as { __breathingManager: { startBreathing: () => void } }).__breathingManager;
-      m.startBreathing();
-    });
-    // Wait into the exhale phase (10s into cycle + 1.5s margin to spawn).
-    await page.waitForTimeout(11500);
+    const canvas = page.locator('#canvas');
+    const box    = await canvas.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await page.waitForTimeout(150);
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    // Inhale fully so the release produces a long exhale.
+    await page.waitForTimeout(2000);
+    await page.mouse.up();
+    // Wait into exhale so particles spawn.
+    await page.waitForTimeout(400);
 
     const result = await page.evaluate(() => {
       type P = {
