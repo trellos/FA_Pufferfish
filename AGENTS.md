@@ -21,13 +21,16 @@ FA_Pufferfish/
   src/
     main.ts               App entry: creates BreathingManager, wires click/touch events
     BreathingManager.ts   Controls screen state (start → breathing → start), timing,
-                          the rAF loop, UI rendering (text, timer bar, play button)
+                          the rAF loop, particle system, UI rendering
     PufferFish.ts         Loads & renders the layered pufferfish assets on a Canvas 2D
                           context; handles phase-based eye/mouth/nose swapping
+    FishGeometry.ts       Single-source-of-truth constants for the fish's anatomical
+                          layout (face Y positions, sprite widths, nostril offset).
+                          Consumed by both PufferFish and BreathingManager.
   public/
     assets/               PNG component images (copied from "Pufferfish Components/")
   tests/
-    breathing.spec.ts     Playwright e2e test suite (4 tests)
+    breathing.spec.ts     Playwright e2e test suite (7 tests)
   playwright.config.ts    Playwright config — runs dev server on port 5173
   vite.config.ts          Vite config (minimal)
   tsconfig.json           TypeScript config (strict mode, bundler module resolution)
@@ -96,7 +99,10 @@ delete old entries — mark them superseded if necessary.
 
 ## Asset notes
 
-All PNG files in `public/assets/` are **white shapes on a transparent background**
-(except `Thermometer.png` which has its own colour data and is currently unused).
+All PNG files in `public/assets/` are **white shapes on a transparent background**.
 They are tinted at runtime using the `source-in` Canvas 2D composite technique.
 See `PufferFish.ts` and `DECISIONS.md §3` for details.
+
+The currently rendered assets are: `Wing_R`, `Belly_Dots`, `Eyes_Relax`, `Eyes_Closed`,
+`Nose_Open`, `Nose_Closed`, `Mouth_Circle`, `Mouth_Closed`, `Glow`, `Spike1`. Any PNG
+under `public/assets/` not in that list is unused — remove it or wire it up.
