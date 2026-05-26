@@ -1,6 +1,11 @@
-﻿import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from '@playwright/test';
 
-// Helper: read every pixel in the canvas and confirm content rendered
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+// Confirm the canvas drew something beyond a flat fill. The start screen draws
+// white text ("Breathe", "Follow the pufferfish") and a near-white play-button
+// triangle. Any near-white pixel proves the foreground rendered — the gradient
+// sky alone never reaches this brightness.
 async function canvasHasContent(page: Page): Promise<boolean> {
   return page.evaluate(() => {
     const canvas = document.getElementById('canvas') as HTMLCanvasElement;
@@ -8,12 +13,8 @@ async function canvasHasContent(page: Page): Promise<boolean> {
     const ctx = canvas.getContext('2d');
     if (!ctx) return false;
     const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-    // At least one non-background pixel exists
-    const bg = [13, 26, 51, 255]; // #0d1a33
     for (let i = 0; i < d.length; i += 4) {
-      if (Math.abs(d[i] - bg[0]) > 10 || Math.abs(d[i+1] - bg[1]) > 10 || Math.abs(d[i+2] - bg[2]) > 10) {
-        return true;
-      }
+      if (d[i] > 240 && d[i + 1] > 240 && d[i + 2] > 240) return true;
     }
     return false;
   });
@@ -26,33 +27,38 @@ async function getScreen(page: Page): Promise<string> {
   });
 }
 
+async function getBreathState(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
+    return m.getBreathState();
+  });
+}
+
+async function clickPlayButton(page: Page): Promise<void> {
+  const canvas = page.locator('#canvas');
+  const box = await canvas.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
 test.describe('Pufferfish Breathing App', () => {
 
   test('loading the page displays the start screen', async ({ page }) => {
     await page.goto('/');
     await page.waitForLoadState('networkidle');
-    // Canvas must exist and be visible
     await expect(page.locator('#canvas')).toBeVisible();
-    // Manager must report start screen
-    const screen = await getScreen(page);
-    expect(screen).toBe('start');
-    // Canvas must have rendered content
+    expect(await getScreen(page)).toBe('start');
     expect(await canvasHasContent(page)).toBe(true);
   });
 
   test('pressing Play once brings up the pufferfish (breathing screen)', async ({ page }) => {
     await page.goto('/');
     await page.waitForLoadState('networkidle');
-    // Confirm start screen first
     expect(await getScreen(page)).toBe('start');
-    // Click the play button area (center-bottom of canvas)
-    const canvas = page.locator('#canvas');
-    const box    = await canvas.boundingBox();
-    expect(box).not.toBeNull();
-    const bx = box!.x + box!.width  / 2;
-    const by = box!.y + box!.height * 0.83;
-    await page.mouse.click(bx, by);
-    // Give one animation frame to process the state change
+    await clickPlayButton(page);
+    // Give one animation frame to process the state change.
     await page.waitForTimeout(100);
     expect(await getScreen(page)).toBe('breathing');
   });
@@ -63,50 +69,35 @@ test.describe('Pufferfish Breathing App', () => {
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
+
     // Enter breathing screen.
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await clickPlayButton(page);
     await page.waitForTimeout(150);
     expect(await getScreen(page)).toBe('breathing');
 
-    // Idle: no breath progress, state should be 'idle'.
-    const idleState = await page.evaluate(() => {
-      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
-      return m.getBreathState();
-    });
-    expect(idleState).toBe('idle');
+    // Idle: no breath progress yet.
+    expect(await getBreathState(page)).toBe('idle');
 
     // Press and hold — should transition to inhaling.
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
     await page.mouse.down();
     await page.waitForTimeout(400);
-    const inhalingState = await page.evaluate(() => {
-      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
-      return m.getBreathState();
-    });
-    expect(inhalingState).toBe('inhaling');
+    expect(await getBreathState(page)).toBe('inhaling');
 
     // Release — should transition to exhaling.
     await page.mouse.up();
     await page.waitForTimeout(100);
-    const exhalingState = await page.evaluate(() => {
-      const m = (window as Record<string, unknown>)['__breathingManager'] as { getBreathState: () => string };
-      return m.getBreathState();
-    });
-    expect(exhalingState).toBe('exhaling');
+    expect(await getBreathState(page)).toBe('exhaling');
   });
 
   test('timer expiring returns to start screen', async ({ page }) => {
-    // Use a 2-second session so the test finishes quickly
-    await page.goto('/?duration=2&cycle=1');
+    // Use a 2-second session so the test finishes quickly.
+    await page.goto('/?duration=2');
     await page.waitForLoadState('networkidle');
-    const canvas = page.locator('#canvas');
-    const box    = await canvas.boundingBox();
-    expect(box).not.toBeNull();
-    // Start breathing
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await clickPlayButton(page);
     await page.waitForTimeout(200);
     expect(await getScreen(page)).toBe('breathing');
-    // Wait for session to expire (2s + buffer)
+    // Wait for session to expire (2s + buffer).
     await page.waitForTimeout(2500);
     expect(await getScreen(page)).toBe('start');
   });
@@ -115,6 +106,7 @@ test.describe('Pufferfish Breathing App', () => {
   // These verify the user-specified contracts on the particle system:
   //   • Every inhale particle has a target that equals one of the two nostril
   //     positions (the particle is heading to a nostril).
+  //   • Every inhale particle physically reaches its target at end-of-life.
   //   • Every exhale particle spawns within the mouth sprite disc.
 
   test('breathe-in particles target a nostril', async ({ page }) => {
@@ -123,8 +115,7 @@ test.describe('Pufferfish Breathing App', () => {
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
-    // Enter breathing screen via the play button.
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await clickPlayButton(page);
     await page.waitForTimeout(150);
     // Press and hold to drive the inhale state — particles only spawn while
     // the breath state is 'inhaling'.
@@ -147,8 +138,8 @@ test.describe('Pufferfish Breathing App', () => {
 
     expect(result.particles.length).toBeGreaterThan(0);
     for (const p of result.particles) {
-      // Every inhale particle must have a target and remember which nostril
-      // positions it was given at spawn.
+      // Every inhale particle must remember the nostril positions it was
+      // given at spawn, and target one of them.
       expect(p.targetX).not.toBeUndefined();
       expect(p.targetY).not.toBeUndefined();
       expect(p.spawnLeftNoseX).not.toBeUndefined();
@@ -173,7 +164,7 @@ test.describe('Pufferfish Breathing App', () => {
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await clickPlayButton(page);
     await page.waitForTimeout(150);
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
     await page.mouse.down();
@@ -214,7 +205,7 @@ test.describe('Pufferfish Breathing App', () => {
     const canvas = page.locator('#canvas');
     const box    = await canvas.boundingBox();
     expect(box).not.toBeNull();
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height * 0.83);
+    await clickPlayButton(page);
     await page.waitForTimeout(150);
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
     await page.mouse.down();
@@ -246,9 +237,8 @@ test.describe('Pufferfish Breathing App', () => {
       const dx = p.spawnX - p.spawnMouthCX!;
       const dy = p.spawnY - p.spawnMouthCY!;
       const dist = Math.hypot(dx, dy);
-      // The spawn point must lie inside the mouth sprite disc.
-      // Tiny floating-point slack (1e-6) is allowed; the spawn function uses
-      // sqrt(random) * mouthR so dist is at most mouthR exactly.
+      // The spawn point must lie inside the mouth sprite disc. Tiny float
+      // slack (1e-6) is allowed since the spawn uses sqrt(random) * mouthR.
       expect(dist).toBeLessThanOrEqual(p.spawnMouthR! + 1e-6);
     }
   });

@@ -24,6 +24,23 @@
 //   inhale  → Eyes_Relax + Nose_Open    + Mouth_Closed
 //   hold    → Eyes_Closed + Nose_Closed + Mouth_Closed   (both at eye row → angry look)
 //   exhale  → Eyes_Relax  + Mouth_Circle (large central nose; no Nose_Closed)
+//
+// Anatomical positions and sprite widths come from FishGeometry.ts so the
+// particle spawner (BreathingManager) sees the same coordinates we render at.
+
+import {
+  EYES_Y_FRAC,
+  NOSE_Y_FRAC,
+  MOUTH_Y_FRAC,
+  BIG_NOSE_Y_FRAC,
+  EYES_RELAX_WIDTH,
+  EYES_CLOSED_WIDTH,
+  NOSE_OPEN_WIDTH,
+  NOSE_CLOSED_WIDTH,
+  MOUTH_CLOSED_INHALE_WIDTH,
+  MOUTH_CLOSED_HOLD_WIDTH,
+  MOUTH_CIRCLE_WIDTH,
+} from './FishGeometry';
 
 export type BreathPhase = 'inhale' | 'hold' | 'exhale';
 
@@ -43,38 +60,48 @@ const SPIKE_COUNT = 10;
 const SX_FACTOR = 1.05;
 const SY_FACTOR = 1.02;
 
+// Face-feature alpha. The tinted PNGs have set stroke thickness; rendering
+// at 0.80 alpha makes them read as "shaded" features rather than bold strokes.
+const FACE_ALPHA = 0.80;
+
 interface Img { el: HTMLImageElement; tinted: HTMLCanvasElement }
 
 export class PufferFish {
   private imgs: Record<string, Img> = {};
   private ready = false;
 
-  constructor(private base = '/assets/') {}
+  constructor(private base: string) {}
 
   async load(): Promise<void> {
     const defs: [string, string][] = [
       ['Wing_R',       TINT.wing        ],
       ['Belly_Dots',   TINT.dots        ],
-      ['Eyes_1',       TINT.face        ],
       ['Eyes_Relax',   TINT.face        ],
       ['Eyes_Closed',  TINT.face        ],
       ['Nose_Open',    TINT.face        ],
       ['Nose_Closed',  TINT.face        ],
-      ['Mouth_Circle', TINT.mouthCircle ],  // big nose — belly-cyan, not navy
+      ['Mouth_Circle', TINT.mouthCircle ],
       ['Mouth_Closed', TINT.face        ],
       ['Glow',         TINT.glow        ],
       ['Spike1',       TINT.spike       ],
     ];
-    await Promise.all(defs.map(([n]) => this.loadOne(n)));
+    const failures: string[] = [];
+    await Promise.all(defs.map(([n]) => this.loadOne(n, failures)));
+    if (failures.length > 0) {
+      // Aggregate failure rather than scattered warns. The fish still renders
+      // without the missing pieces, but a missing asset is almost certainly a
+      // build/deploy problem the developer needs to see.
+      console.error(`PufferFish: failed to load ${failures.length} asset(s): ${failures.join(', ')}`);
+    }
     for (const [n, c] of defs) this.makeTinted(n, c);
     this.ready = true;
   }
 
-  private loadOne(name: string): Promise<void> {
+  private loadOne(name: string, failures: string[]): Promise<void> {
     return new Promise(resolve => {
       const img = new Image();
       img.onload  = () => { this.imgs[name] = { el: img, tinted: null! }; resolve(); };
-      img.onerror = () => { console.warn(`Missing: ${name}.png`); resolve(); };
+      img.onerror = () => { failures.push(`${name}.png`); resolve(); };
       img.src = `${this.base}${name}.png`;
     });
   }
@@ -94,8 +121,8 @@ export class PufferFish {
     this.imgs[name].tinted = oc;
   }
 
-  // Draw a tinted sprite centered at the current origin, scaled to `targetW`
-  // while preserving aspect ratio. Optionally offset by (dx,dy) and rotated.
+  // Draw a tinted sprite centered at (dx,dy), scaled to `targetW` preserving
+  // aspect ratio. Alpha is applied via globalAlpha when not 1.
   private blit(
     ctx: CanvasRenderingContext2D,
     name: string,
@@ -141,7 +168,6 @@ export class PufferFish {
     baseR: number,
     scale: number,
     phase: BreathPhase,
-    _phaseT = 0,
   ): void {
     if (!this.ready) return;
 
@@ -292,23 +318,17 @@ export class PufferFish {
     // positioning produces the angled "squinty" marks above the eye dashes
     // organically — one merged row, not two.
     const hr = baseR;
-    const EYES_Y     = -hr * 0.52;   // Eyes_Relax / Eyes_Closed
-    const NOSE_Y     = -hr * 0.52;   // Nose_Open / Nose_Closed — same row as eyes
-    const MOUTH_Y    = -hr * 0.30;   // Mouth_Closed dash, just below the eye row
-    const BIG_NOSE_Y = -hr * 0.38;   // Mouth_Circle, slightly below eye row
-
-    // Face features are tinted PNGs with set stroke thickness. To make them
-    // appear THINNER/SOFTER (closer to the reference), draw at alpha 0.80 so
-    // they read as "shaded" features rather than bold paint strokes.
-    const FACE_ALPHA = 0.80;
+    const eyesY    = hr * EYES_Y_FRAC;
+    const noseY    = hr * NOSE_Y_FRAC;
+    const mouthY   = hr * MOUTH_Y_FRAC;
+    const bigNoseY = hr * BIG_NOSE_Y_FRAC;
 
     if (phase === 'inhale') {
-      // Eyes_Relax + Nose_Open + Mouth_Closed.
-      // Reference p_008 (Breathe In) shows: nose dots close together, and a
-      // VERY SHORT mouth dash. Width 0.32*hr keeps the mouth subtle.
-      this.blit(ctx, 'Eyes_Relax',   hr * 1.55, 0, EYES_Y,    FACE_ALPHA);
-      this.blit(ctx, 'Nose_Open',    hr * 0.30, 0, NOSE_Y,    FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Closed', hr * 0.32, 0, MOUTH_Y,   FACE_ALPHA);
+      // Reference p_008 (Breathe In): nose dots close together, a VERY SHORT
+      // mouth dash. Subtle mouth keeps the face calm.
+      this.blit(ctx, 'Eyes_Relax',   hr * EYES_RELAX_WIDTH,            0, eyesY,  FACE_ALPHA);
+      this.blit(ctx, 'Nose_Open',    hr * NOSE_OPEN_WIDTH,             0, noseY,  FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', hr * MOUTH_CLOSED_INHALE_WIDTH,   0, mouthY, FACE_ALPHA);
     } else if (phase === 'hold') {
       // Hold face: 4 distinct angled marks on the eye row + mouth dash.
       // Eyes_Closed.png has 2 dashes at the FAR L/R edges of its bounding
@@ -317,17 +337,14 @@ export class PufferFish {
       // so drawing it MUCH NARROWER places those slashes near the CENTRE,
       // producing the INNER pair. The big size difference is intentional:
       // outer pair lands at ±~0.62*hr, inner pair at ±~0.20*hr.
-      this.blit(ctx, 'Eyes_Closed',  hr * 1.30, 0, EYES_Y,    FACE_ALPHA);
-      this.blit(ctx, 'Nose_Closed',  hr * 0.42, 0, NOSE_Y,    FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Closed', hr * 0.55, 0, MOUTH_Y,   FACE_ALPHA);
+      this.blit(ctx, 'Eyes_Closed',  hr * EYES_CLOSED_WIDTH,          0, eyesY,  FACE_ALPHA);
+      this.blit(ctx, 'Nose_Closed',  hr * NOSE_CLOSED_WIDTH,          0, noseY,  FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', hr * MOUTH_CLOSED_HOLD_WIDTH,    0, mouthY, FACE_ALPHA);
     } else {
       // exhale — Eyes_Relax + Mouth_Circle (big nose). NO Nose_Closed: the
       // big central nose IS the feature; adding brows would clutter it.
-      // Reference c_025 shows the central nose much smaller than before —
-      // it's a defined feature but doesn't dominate the face. Dropping the
-      // width from 0.60 → 0.38 brings it in line with the reference.
-      this.blit(ctx, 'Eyes_Relax',   hr * 1.55, 0, EYES_Y,     FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Circle', hr * 0.38, 0, BIG_NOSE_Y, FACE_ALPHA);
+      this.blit(ctx, 'Eyes_Relax',   hr * EYES_RELAX_WIDTH,            0, eyesY,    FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Circle', hr * MOUTH_CIRCLE_WIDTH,          0, bigNoseY, FACE_ALPHA);
     }
 
     ctx.restore();
