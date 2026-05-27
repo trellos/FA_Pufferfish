@@ -49,7 +49,7 @@ interface ParticleBase {
   spawnX: number; spawnY: number;
 }
 
-export interface InhaleParticle extends ParticleBase {
+interface InhaleParticle extends ParticleBase {
   kind: 'inhale';
   // The nostril the particle is heading to. `targetSide` is sticky (set at
   // spawn) so a particle commits to one side and doesn't ping-pong; targetX/Y
@@ -63,7 +63,7 @@ export interface InhaleParticle extends ParticleBase {
   spawnNoseY: number;
 }
 
-export interface ExhaleParticle extends ParticleBase {
+interface ExhaleParticle extends ParticleBase {
   kind: 'exhale';
   // Snapshot of mouth-disc geometry at spawn time.
   spawnMouthCX: number;

@@ -52,7 +52,6 @@ export const MOUTH_CLOSED_WIDTH_PEAK = 0.321;
 // 0.270 of baseR. Idle 1.38 * 0.040 = 0.055 → 0.139 of baseR.
 export const MOUTH_CIRCLE_WIDTH_IDLE = 0.139;
 export const MOUTH_CIRCLE_WIDTH_PEAK = 0.270;
-export const MOUTH_CIRCLE_RADIUS_PEAK = MOUTH_CIRCLE_WIDTH_PEAK / 2;
 
 // ── Other face-feature widths (constant — only Mouth animates in BreatheIn) ─
 // Eyes_Relax sprite 386x45 px = 3.86x0.45 units. At face scale 1.0 inside Face
