@@ -109,7 +109,7 @@ test.describe('Pufferfish Breathing App', () => {
   //   • Every inhale particle physically reaches its target at end-of-life.
   //   • Every exhale particle spawns within the mouth sprite disc.
 
-  test('breathe-in particles target a nostril', async ({ page }) => {
+  test('breathe-in particles target a live nostril', async ({ page }) => {
     await page.goto('/?duration=60');
     await page.waitForLoadState('networkidle');
     const canvas = page.locator('#canvas');
@@ -126,31 +126,37 @@ test.describe('Pufferfish Breathing App', () => {
     const result = await page.evaluate(() => {
       type P = {
         kind: 'inhale' | 'exhale';
+        targetSide?: 'left' | 'right';
         targetX?: number; targetY?: number;
         spawnLeftNoseX?: number; spawnRightNoseX?: number; spawnNoseY?: number;
       };
+      type M = { leftNostrilX: number; rightNostrilX: number; nostrilY: number };
       const mgr = (window as unknown as {
-        __breathingManager: { getParticles: () => P[] };
+        __breathingManager: {
+          getParticles: () => P[];
+          getFishMetrics: () => M | null;
+        };
       }).__breathingManager;
       const particles = mgr.getParticles().filter(p => p.kind === 'inhale');
-      return { particles };
+      const metrics = mgr.getFishMetrics();
+      return { particles, metrics };
     });
 
     expect(result.particles.length).toBeGreaterThan(0);
+    expect(result.metrics).not.toBeNull();
+    const m = result.metrics!;
     for (const p of result.particles) {
-      // Every inhale particle must remember the nostril positions it was
-      // given at spawn, and target one of them.
-      expect(p.targetX).not.toBeUndefined();
-      expect(p.targetY).not.toBeUndefined();
+      // Every inhale particle is committed to a side at spawn and continues
+      // to chase the LIVE position of that nostril as the face shifts.
+      expect(p.targetSide === 'left' || p.targetSide === 'right').toBe(true);
+      const expectedX = p.targetSide === 'left' ? m.leftNostrilX : m.rightNostrilX;
+      expect(p.targetX!).toBeCloseTo(expectedX, 5);
+      expect(p.targetY!).toBeCloseTo(m.nostrilY, 5);
+      // Spawn snapshot fields are still recorded so we can reason about the
+      // particle's original geometry.
       expect(p.spawnLeftNoseX).not.toBeUndefined();
       expect(p.spawnRightNoseX).not.toBeUndefined();
       expect(p.spawnNoseY).not.toBeUndefined();
-      // The target Y must equal the nostril row from the SAME frame as spawn.
-      expect(p.targetY!).toBe(p.spawnNoseY!);
-      // The target X must equal EITHER the left or right nostril X from spawn.
-      const onLeft  = p.targetX! === p.spawnLeftNoseX!;
-      const onRight = p.targetX! === p.spawnRightNoseX!;
-      expect(onLeft || onRight).toBe(true);
     }
     await page.mouse.up();
   });
@@ -198,7 +204,7 @@ test.describe('Pufferfish Breathing App', () => {
     await page.mouse.up();
   });
 
-  test('breathe-out particles only spawn within the mouth sprite disc', async ({ page }) => {
+  test('breathe-out particles spawn in an inner ring of the mouth disc (0.2..0.8 of mouthR)', async ({ page }) => {
     // Drive an inhale, then release to enter exhale and spawn exhale particles.
     await page.goto('/?duration=60');
     await page.waitForLoadState('networkidle');
@@ -212,8 +218,9 @@ test.describe('Pufferfish Breathing App', () => {
     // Inhale fully so the release produces a long exhale.
     await page.waitForTimeout(2000);
     await page.mouse.up();
-    // Wait into exhale so particles spawn.
-    await page.waitForTimeout(400);
+    // Wait into exhale so particles spawn — sample early so trails haven't
+    // traveled far from their spawn point.
+    await page.waitForTimeout(120);
 
     const result = await page.evaluate(() => {
       type P = {
@@ -230,16 +237,20 @@ test.describe('Pufferfish Breathing App', () => {
 
     expect(result.particles.length).toBeGreaterThan(0);
     for (const p of result.particles) {
-      // Each exhale particle remembers the mouth disc it was spawned in.
+      // Each exhale particle remembers the mouth disc it was spawned around.
       expect(p.spawnMouthCX).not.toBeUndefined();
       expect(p.spawnMouthCY).not.toBeUndefined();
       expect(p.spawnMouthR).not.toBeUndefined();
       const dx = p.spawnX - p.spawnMouthCX!;
       const dy = p.spawnY - p.spawnMouthCY!;
       const dist = Math.hypot(dx, dy);
-      // The spawn point must lie inside the mouth sprite disc. Tiny float
-      // slack (1e-6) is allowed since the spawn uses sqrt(random) * mouthR.
-      expect(dist).toBeLessThanOrEqual(p.spawnMouthR! + 1e-6);
+      // Spawn point lies in the inner mouth ring: between 0.2 and 0.8 of
+      // mouthR from the mouth centre. The empty centre keeps trails from
+      // converging visually; the empty outer rim is filled by the mouth
+      // sprite itself.
+      const ratio = dist / p.spawnMouthR!;
+      expect(ratio).toBeGreaterThanOrEqual(0.2 - 1e-6);
+      expect(ratio).toBeLessThanOrEqual(0.8 + 1e-6);
     }
   });
 

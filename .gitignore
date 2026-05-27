@@ -23,3 +23,6 @@ reference/
 .vscode/
 .idea/
 *.swp
+
+# Ephemeral preview-render scratch
+.tmp/

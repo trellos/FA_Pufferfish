@@ -5,21 +5,18 @@
 
 import { PufferFish, BreathPhase } from './PufferFish';
 import {
-  NOSE_Y_FRAC,
-  BIG_NOSE_Y_FRAC,
-  MOUTH_CIRCLE_RADIUS,
+  FACE_Y_IDLE_FRAC, FACE_Y_PEAK_FRAC,
+  FACE_SCALE_IDLE,  FACE_SCALE_PEAK,
+  NOSE_LOCAL_Y_FRAC,
+  MOUTH_LOCAL_Y_FRAC,
   NOSTRIL_OFFSET_X,
+  MOUTH_CIRCLE_WIDTH_IDLE, MOUTH_CIRCLE_WIDTH_PEAK,
+  SCALE_MIN, SCALE_MAX, FULL_BREATH_SECS,
+  COLOR_BACKGROUND,
 } from './FishGeometry';
 
 type Screen = 'start' | 'breathing';
 type BreathState = 'idle' | 'inhaling' | 'holding' | 'exhaling';
-
-// Seconds to go from min → max scale while held. Exhale uses the same rate,
-// so partial inhales exhale in the same time they inhaled.
-const FULL_BREATH_SECS = 5;
-
-const SCALE_MIN = 0.78;
-const SCALE_MAX = 1.22;
 
 function urlNum(key: string, fallback: number): number {
   const v = new URLSearchParams(window.location.search).get(key);
@@ -30,6 +27,10 @@ function urlNum(key: string, fallback: number): number {
 
 function easeInOutSine(t: number): number {
   return -(Math.cos(Math.PI * t) - 1) / 2;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 // ── Particle types ─────────────────────────────────────────────────────────
@@ -50,6 +51,11 @@ interface ParticleBase {
 
 export interface InhaleParticle extends ParticleBase {
   kind: 'inhale';
+  // The nostril the particle is heading to. `targetSide` is sticky (set at
+  // spawn) so a particle commits to one side and doesn't ping-pong; targetX/Y
+  // are refreshed every frame to the LIVE position of that nostril so the
+  // particle's trajectory tracks the face as the body puffs up.
+  targetSide: 'left' | 'right';
   targetX: number; targetY: number;
   // Snapshot of nostril geometry at spawn time.
   spawnLeftNoseX: number;
@@ -148,21 +154,40 @@ export class BreathingManager {
   }
 
   // Compute screen-space positions of the nostrils and the mouth sprite for
-  // the current frame, using the canonical body-local fractions from
-  // FishGeometry. This is the only place those fractions get projected.
+  // the current frame. The face position, face scale, and mouth size all
+  // animate with breath progress, so we interpolate them here using the same
+  // curves PufferFish.render uses — keeps the spawner and the renderer in
+  // lockstep, which is critical for the inhale particles to actually hit
+  // the nostrils.
   private computeMetrics(
     fishX: number, fishY: number,
-    baseR: number, scale: number,
+    baseR: number, scale: number, progress: number,
   ): FishMetrics {
+    // Face transform: y position and scale animate with progress.
+    const faceY     = baseR * lerp(FACE_Y_IDLE_FRAC, FACE_Y_PEAK_FRAC, progress);
+    const faceScale = lerp(FACE_SCALE_IDLE, FACE_SCALE_PEAK, progress);
+
+    // Nostril Y = face Y + nose local Y (face-scaled).
+    const noseY  = faceY + baseR * NOSE_LOCAL_Y_FRAC  * faceScale;
+    // Mouth Y for big-circle (exhale).
+    const mouthY = faceY + baseR * MOUTH_LOCAL_Y_FRAC * faceScale;
+
+    // Mouth_Circle radius scales with progress and face scale.
+    const mouthCircleW = baseR
+      * lerp(MOUTH_CIRCLE_WIDTH_IDLE, MOUTH_CIRCLE_WIDTH_PEAK, progress)
+      * faceScale;
+
+    // The body's outer ctx.scale(scale, scale) is applied to face positions
+    // too, so multiply by `scale` for screen-space coordinates.
     return {
       fishX, fishY, baseR, scale,
       scaledR:       baseR * scale,
-      leftNostrilX:  fishX + (-baseR * NOSTRIL_OFFSET_X) * scale,
-      rightNostrilX: fishX + ( baseR * NOSTRIL_OFFSET_X) * scale,
-      nostrilY:      fishY + ( baseR * NOSE_Y_FRAC)      * scale,
+      leftNostrilX:  fishX + (-baseR * NOSTRIL_OFFSET_X * faceScale) * scale,
+      rightNostrilX: fishX + ( baseR * NOSTRIL_OFFSET_X * faceScale) * scale,
+      nostrilY:      fishY + noseY * scale,
       mouthCX:       fishX,
-      mouthCY:       fishY + ( baseR * BIG_NOSE_Y_FRAC)  * scale,
-      mouthR:        baseR * MOUTH_CIRCLE_RADIUS * scale,
+      mouthCY:       fishY + mouthY * scale,
+      mouthR:        (mouthCircleW / 2) * scale,
     };
   }
 
@@ -185,12 +210,15 @@ export class BreathingManager {
     const dist  = m.scaledR * (1.25 + Math.random() * 0.55);
     const x = fishX + Math.cos(angle) * dist;
     const y = fishY + Math.sin(angle) * dist;
-    // Pick the nearer nostril by Euclidean distance.
+    // Pick the nearer nostril by Euclidean distance — this commits the
+    // particle to a side for its whole life so it doesn't switch sides
+    // mid-flight when the face shifts. The actual target X/Y is recomputed
+    // each frame in updateParticles.
     const dLx = x - m.leftNostrilX,  dLy = y - m.nostrilY;
     const dRx = x - m.rightNostrilX, dRy = y - m.nostrilY;
-    const targetX = (dLx * dLx + dLy * dLy) < (dRx * dRx + dRy * dRy)
-      ? m.leftNostrilX
-      : m.rightNostrilX;
+    const targetSide: 'left' | 'right' =
+      (dLx * dLx + dLy * dLy) < (dRx * dRx + dRy * dRy) ? 'left' : 'right';
+    const targetX = targetSide === 'left' ? m.leftNostrilX : m.rightNostrilX;
     const targetY = m.nostrilY;
     const dx = targetX - x;
     const dy = targetY - y;
@@ -198,6 +226,8 @@ export class BreathingManager {
     // The particle MUST physically arrive at the nostril before dying.
     // Pick a random lifetime; set speed = distance / lifetime and decay =
     // 1 / lifetime so position at t=lifetime equals the target exactly.
+    // The velocity is refreshed every frame in updateParticles, so this
+    // initial value is just the first-frame heading.
     const lifetimeSec = 0.55 + Math.random() * 0.30; // 0.55..0.85s
     const speed = norm / lifetimeSec;
     const decay = 1 / lifetimeSec;
@@ -209,6 +239,7 @@ export class BreathingManager {
       life: 1,
       decay,
       spawnX: x, spawnY: y,
+      targetSide,
       targetX, targetY,
       spawnLeftNoseX:  m.leftNostrilX,
       spawnRightNoseX: m.rightNostrilX,
@@ -217,28 +248,17 @@ export class BreathingManager {
   }
 
   private spawnExhaleParticle(m: FishMetrics): void {
-    // Uniform point in disc: sqrt(uniform) gives even areal density.
+    // Spawn INSIDE the mouth disc but in a ring that skips the dead centre
+    // (0..20% of mouthR) and the outer rim (80%..100%). Velocity is strictly
+    // radially outward from the mouth centre, so every trail stays on its own
+    // radial spoke — no two ever cross, and the empty centre keeps the middle
+    // of the mouth visually clear of converging trails.
     const ang0 = Math.random() * Math.PI * 2;
-    const rad0 = Math.sqrt(Math.random()) * m.mouthR;
+    const rad0 = m.mouthR * (0.2 + Math.random() * 0.6);  // 0.2..0.8 * mouthR
     const sx = m.mouthCX + Math.cos(ang0) * rad0;
     const sy = m.mouthCY + Math.sin(ang0) * rad0;
-    // Direction = radial outward from mouth center. If the spawn landed
-    // exactly at the center, pick a random outward angle instead.
-    let dirX: number, dirY: number;
-    if (rad0 < 1e-3) {
-      const a = Math.random() * Math.PI * 2;
-      dirX = Math.cos(a);
-      dirY = Math.sin(a);
-    } else {
-      const norm = Math.hypot(sx - m.mouthCX, sy - m.mouthCY) || 1;
-      dirX = (sx - m.mouthCX) / norm;
-      dirY = (sy - m.mouthCY) / norm;
-    }
-    // Small downward bias so the overall flow reads as "exhaling toward the
-    // floor". Re-normalize after biasing.
-    dirY += 0.35;
-    const n2 = Math.hypot(dirX, dirY) || 1;
-    dirX /= n2; dirY /= n2;
+    const dirX = Math.cos(ang0);
+    const dirY = Math.sin(ang0);
     const speed = 140 + Math.random() * 80;
     this.particles.push({
       kind: 'exhale',
@@ -263,9 +283,24 @@ export class BreathingManager {
       if (Math.random() < dt * 18) this.spawnExhaleParticle(m);
     }
 
-    // Advance every particle; drop expired ones.
+    // Advance every particle; drop expired ones. For inhale particles we
+    // re-aim each frame: the nostril moves as the body inflates, so we
+    // recompute the live target, then derive velocity = (target - pos) /
+    // remaining_life so the particle still arrives at end-of-life even
+    // though the destination keeps shifting under it.
     const keep: Particle[] = [];
     for (const p of this.particles) {
+      if (p.kind === 'inhale') {
+        const liveTargetX = p.targetSide === 'left' ? m.leftNostrilX : m.rightNostrilX;
+        const liveTargetY = m.nostrilY;
+        const remaining = p.life / p.decay;  // seconds until life hits 0
+        if (remaining > 1e-4) {
+          p.vx = (liveTargetX - p.x) / remaining;
+          p.vy = (liveTargetY - p.y) / remaining;
+        }
+        p.targetX = liveTargetX;
+        p.targetY = liveTargetY;
+      }
       p.x    += p.vx * dt;
       p.y    += p.vy * dt;
       p.life -= p.decay * dt;
@@ -275,34 +310,66 @@ export class BreathingManager {
   }
 
   private drawParticles(ctx: CanvasRenderingContext2D): void {
-    // Comet trails (reference p_008): a small bright head + a long fading
-    // tail aligned with velocity (tail points BEHIND the motion direction).
-    const TRAIL_LEN = 0.35;
+    // Comet trails: a small bright head + a fading tail behind the head.
+    // Two key constraints control the tail:
+    //   • The tail length is CLAMPED to how far the particle has moved
+    //     from its spawn point. A particle's tail never extends back
+    //     past the spawn point — at spawn the trail is zero length
+    //     (just the head), then grows as the particle travels. This is
+    //     critical for exhale particles: without clamping, a tail that
+    //     spawns inside the mouth disc would point radially inward and
+    //     extend through the mouth centre, visually crossing every
+    //     other particle's tail. With clamping, each radial spoke owns
+    //     its own outward strip and trails never cross.
+    //   • Inhale particles keep full opacity for most of their flight
+    //     and only fade in the last ~25% of life (right before they
+    //     reach the nostril). Exhale particles fade linearly over their
+    //     whole life so they dissipate as they spread outward.
+    const TRAIL_LEN_SECS = 0.35;
     const HEAD_RADIUS = 3.2;
     const TAIL_LINE_WIDTH = 6.5;
 
     for (const p of this.particles) {
-      const a = Math.max(0, Math.min(1, p.life));
       const speed = Math.hypot(p.vx, p.vy);
       if (speed < 1) continue;
 
-      const tailX = p.x - p.vx * TRAIL_LEN;
-      const tailY = p.y - p.vy * TRAIL_LEN;
+      const a = p.kind === 'inhale'
+        // Stay at full opacity until life drops below 0.25, then linear
+        // fade to 0 — produces a sharp puff at the nostril just before
+        // disappearance.
+        ? Math.max(0, Math.min(1, p.life * 4))
+        : Math.max(0, Math.min(1, p.life));
+
+      // Tail length: full = speed * TRAIL_LEN_SECS, clamped to the
+      // distance the particle has already travelled from spawn.
+      const dxFromSpawn = p.x - p.spawnX;
+      const dyFromSpawn = p.y - p.spawnY;
+      const distFromSpawn = Math.hypot(dxFromSpawn, dyFromSpawn);
+      const fullTailLen = speed * TRAIL_LEN_SECS;
+      const tailLen = Math.min(fullTailLen, distFromSpawn);
+      // Tail unit vector: -velocity / speed.
+      const tailX = p.x - (p.vx / speed) * tailLen;
+      const tailY = p.y - (p.vy / speed) * tailLen;
 
       ctx.save();
 
-      // Gradient stroke from bright head → transparent tail end.
-      const grad = ctx.createLinearGradient(p.x, p.y, tailX, tailY);
-      grad.addColorStop(0,    `rgba(216, 244, 255, ${a * 0.95})`);
-      grad.addColorStop(0.25, `rgba(216, 244, 255, ${a * 0.55})`);
-      grad.addColorStop(1,    `rgba(216, 244, 255, 0)`);
-      ctx.strokeStyle = grad;
-      ctx.lineCap = 'round';
-      ctx.lineWidth = TAIL_LINE_WIDTH;
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(tailX, tailY);
-      ctx.stroke();
+      // Gradient stroke from bright head → transparent tail end. Skip
+      // when the tail has zero length (just-spawned particles): a
+      // degenerate linear gradient on a zero-length line is undefined,
+      // and the head dot drawn below renders the particle anyway.
+      if (tailLen > 0.5) {
+        const grad = ctx.createLinearGradient(p.x, p.y, tailX, tailY);
+        grad.addColorStop(0,    `rgba(216, 244, 255, ${a * 0.95})`);
+        grad.addColorStop(0.25, `rgba(216, 244, 255, ${a * 0.55})`);
+        grad.addColorStop(1,    `rgba(216, 244, 255, 0)`);
+        ctx.strokeStyle = grad;
+        ctx.lineCap = 'round';
+        ctx.lineWidth = TAIL_LINE_WIDTH;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(tailX, tailY);
+        ctx.stroke();
+      }
 
       // Bright dot at the head.
       ctx.fillStyle = `rgba(255, 255, 255, ${a * 0.95})`;
@@ -315,32 +382,12 @@ export class BreathingManager {
   }
 
   // ── Background ─────────────────────────────────────────────────────────────
+  // Matches the Unity DeepBreathing prefab "Extra Large BG" sprite colour
+  // (RGB 0.031, 0.094, 0.235 → #08183C). Flat fill, no gradient.
 
-  private drawBackground(
-    ctx: CanvasRenderingContext2D,
-    W: number, H: number,
-    glowX?: number, glowY?: number, glowR?: number,
-  ): void {
-    const bg = ctx.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, '#193F7E');
-    bg.addColorStop(1, '#3A7BE0');
-    ctx.fillStyle = bg;
+  private drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+    ctx.fillStyle = COLOR_BACKGROUND;
     ctx.fillRect(0, 0, W, H);
-
-    if (glowX !== undefined && glowY !== undefined && glowR !== undefined) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      const r2 = glowR * 1.45;
-      const grad = ctx.createRadialGradient(glowX, glowY, glowR * 0.85, glowX, glowY, r2);
-      grad.addColorStop(0,    'rgba(0,255,255,0.0)');
-      grad.addColorStop(0.30, 'rgba(0,240,255,0.55)');
-      grad.addColorStop(0.55, 'rgba(0,220,255,0.30)');
-      grad.addColorStop(0.80, 'rgba(0,160,240,0.12)');
-      grad.addColorStop(1,    'rgba(0,30,190,0.0)');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, W, H);
-      ctx.restore();
-    }
   }
 
   // ── Loop ──────────────────────────────────────────────────────────────────
@@ -409,13 +456,16 @@ export class BreathingManager {
   private drawStart(t: number): void {
     const { ctx, cssW: W, cssH: H } = this;
 
-    const idleScale = 0.92 + Math.sin(t * 0.8) * 0.04;
-    const r = Math.min(W, H) * 0.26;
+    // Idle hover: gently breathe between min/peak with a slow sine. The fish
+    // sits at ~mid-inflation so spikes and face proportions read natural.
+    const idleEnvelope = 0.5 + 0.18 * Math.sin(t * 0.8);
+    const idleScale = lerp(SCALE_MIN, SCALE_MAX, idleEnvelope);
+    const r = Math.min(W, H) * 0.30;
     const fishX = W / 2;
     const fishY = H * 0.40;
 
-    this.drawBackground(ctx, W, H, fishX, fishY, r * idleScale);
-    this.fish.render(ctx, fishX, fishY, r, idleScale, 'exhale');
+    this.drawBackground(ctx, W, H);
+    this.fish.render(ctx, fishX, fishY, r, idleScale, idleEnvelope, 'exhale');
 
     const titleSz = Math.min(W * 0.115, 52);
     ctx.textAlign    = 'center';
@@ -467,26 +517,23 @@ export class BreathingManager {
       /* idle */                        'exhale';
 
     const eased = easeInOutSine(this.breathProgress);
-    const scale = SCALE_MIN + eased * (SCALE_MAX - SCALE_MIN);
+    const scale = lerp(SCALE_MIN, SCALE_MAX, eased);
 
-    // baseR is the silhouette radius unit. With sx=1.05*baseR, sy=1.02*baseR
-    // (slightly fuller bottom), the silhouette is ~2.10*baseR wide × ~2.04*baseR
-    // tall before scaling. At scale=1.22 that's ~2.56*baseR wide × ~2.49*baseR
-    // tall, filling ~85-87% of viewport width at peak inflation.
-    const r     = Math.min(W, H) * 0.34;
+    // baseR is the silhouette radius unit. With Unity SCALE_MAX = 1.0 the
+    // peak body radius equals baseR. At ~40% of viewport min dimension, the
+    // peak body fills ~80% of the viewport width — comfortable on both
+    // landscape and portrait phones.
+    const r     = Math.min(W, H) * 0.40;
     const fishX = W / 2;
-    const fishY = H * 0.48;
+    const fishY = H * 0.50;
 
-    // Background paints the gradient sky and a soft halo behind the fish. The
-    // PufferFish sprite layer also draws Glow.png directly, so the two layers
-    // together produce the bloom.
-    this.drawBackground(ctx, W, H, fishX, fishY, r * scale);
+    this.drawBackground(ctx, W, H);
 
     // Cache metrics so getFishMetrics() returns the same numbers the spawner
     // uses, and so the particle update sees consistent geometry this frame.
-    this.metrics = this.computeMetrics(fishX, fishY, r, scale);
+    this.metrics = this.computeMetrics(fishX, fishY, r, scale, eased);
     this.updateParticles(dt, phase, this.metrics);
-    this.fish.render(ctx, fishX, fishY, r, scale, phase);
+    this.fish.render(ctx, fishX, fishY, r, scale, eased, phase);
     this.drawParticles(ctx);
 
     this.drawBreathBar(W / 2, H * 0.08, Math.min(W * 0.75, 520), 36, this.breathProgress);

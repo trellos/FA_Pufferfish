@@ -1,96 +1,94 @@
-// PufferFish — Canvas 2D sprite compositor.
+// PufferFish — Canvas 2D sprite compositor matching the Unity Pufferfish
+// prefab at MightierApp/Assets/Hub/InteractiveSkills/Pufferfish/.
 //
-// The silhouette is ONE smooth egg-shaped ellipse (slightly wider at the
-// bottom). The "dark belly" is NOT a separate body — it's a darker gradient
-// region drawn INSIDE the silhouette, clipped to the outer outline. This
-// avoids the "snowman bisection" effect where a head circle pokes above a
-// belly circle: the outer outline is a single curve.
+// Body shape comes from Body.png (the actual Unity silhouette); the dark
+// belly band comes from Belly_Base.png clipped to the body via an offscreen
+// composite mask; Gradient_1.png paints the belly highlight. All face/wing/
+// spike sprites are pre-tinted PNGs blitted with drawImage.
 //
-// All drawable bits (spikes, wings, dots, glow, eyes/nose/mouth) are
-// pre-tinted PNG sprites blitted with drawImage. The body silhouette is
-// drawn with ellipse() so we can apply gradient fills cleanly.
+// Sort order (back → front) mirrors the Unity SpriteRenderer m_SortingOrder
+// values from the prefab:
+//   46-47  ambient meter art (not rendered here)
+//   48     Glow halo, Wings
+//   49     Spikes
+//   50     Body silhouette (Body.png)
+//   51     Belly_Base — clipped to body
+//   52     Belly_Dots, Gradient_1 — clipped to body
+//   53     Face features (Eyes, Nose, Mouth)
 //
-// Layer order (back to front):
-//   1. Glow.png         — soft halo (low alpha, screen blend)
-//   2. Wings            — drawn BEHIND body; inner half is covered by body,
-//                         outer half peeks past the body edge
-//   3. Spikes ×10       — also BEHIND body; only the outer tips visible
-//   4. Body fill        — bright cyan ellipse (the silhouette base)
-//   5. Dark belly       — gradient ellipse clipped to the silhouette (inside)
-//   6. Belly_Dots.png   — bright cyan, clipped to the silhouette (drawn ONCE)
-//   7. Face features    — eyes/nose/mouth in upper third of the silhouette
-//
-// Phases:
+// Phase-driven face swaps:
 //   inhale  → Eyes_Relax + Nose_Open    + Mouth_Closed
-//   hold    → Eyes_Closed + Nose_Closed + Mouth_Closed   (both at eye row → angry look)
-//   exhale  → Eyes_Relax  + Mouth_Circle (large central nose; no Nose_Closed)
+//   hold    → Eyes_Closed + Nose_Closed + Mouth_Closed (squinty)
+//   exhale  → Eyes_Relax  + Nose_Closed + Mouth_Circle (big O)
 //
-// Anatomical positions and sprite widths come from FishGeometry.ts so the
-// particle spawner (BreathingManager) sees the same coordinates we render at.
+// Inflation drives a separate `progress` (0..1) parameter so the renderer
+// can animate face Y position, face scale, mouth scale, belly position,
+// belly scale, and spike scale to mirror the Puffer_BreatheIn keyframes.
 
 import {
-  EYES_Y_FRAC,
-  NOSE_Y_FRAC,
-  MOUTH_Y_FRAC,
-  BIG_NOSE_Y_FRAC,
-  EYES_RELAX_WIDTH,
-  EYES_CLOSED_WIDTH,
-  NOSE_OPEN_WIDTH,
-  NOSE_CLOSED_WIDTH,
-  MOUTH_CLOSED_INHALE_WIDTH,
-  MOUTH_CLOSED_HOLD_WIDTH,
-  MOUTH_CIRCLE_WIDTH,
+  FACE_Y_IDLE_FRAC, FACE_Y_PEAK_FRAC,
+  FACE_SCALE_IDLE,  FACE_SCALE_PEAK,
+  EYES_LOCAL_Y_FRAC, NOSE_LOCAL_Y_FRAC, MOUTH_LOCAL_Y_FRAC,
+  MOUTH_CLOSED_WIDTH_IDLE, MOUTH_CLOSED_WIDTH_PEAK,
+  MOUTH_CIRCLE_WIDTH_IDLE, MOUTH_CIRCLE_WIDTH_PEAK,
+  EYES_RELAX_WIDTH, EYES_CLOSED_WIDTH,
+  NOSE_OPEN_WIDTH,  NOSE_CLOSED_WIDTH,
+  BELLY_Y_IDLE_FRAC, BELLY_Y_PEAK_FRAC,
+  BELLY_SCALE_IDLE,  BELLY_SCALE_PEAK,
+  BELLY_DOTS_WIDTH,
+  SPIKE_COUNT, SPIKE_RADIAL_FRAC,
+  SPIKE_SIZE_BASE_FRAC, SPIKE_SCALE_IDLE, SPIKE_SCALE_PEAK,
+  WING_FLAP_HZ, WING_FLAP_DEG,
+  WING_WIDTH_FRAC, WING_HEIGHT_FRAC,
+  WING_ANCHOR_X_FRAC, WING_ANCHOR_Y_FRAC,
+  GLOW_WIDTH_FRAC,
+  BODY_WIDTH_FRAC, BELLY_WIDTH_FRAC, GRADIENT_WIDTH_FRAC,
+  COLOR_BODY, COLOR_BELLY_BASE, COLOR_BELLY_DOTS, COLOR_GRADIENT,
+  COLOR_SPIKE, COLOR_GLOW, COLOR_FACE, COLOR_WING,
 } from './FishGeometry';
 
 export type BreathPhase = 'inhale' | 'hold' | 'exhale';
 
-const TINT = {
-  wing:        '#FFFFFF',
-  dots:        '#80EEFF',
-  face:        '#0F80C2',          // medium blue for eyes/nose-marks/mouth-dash
-  mouthCircle: '#0F80C2',          // big central nose — same medium blue as other features
-  glow:        '#C8F4FF',
-  spike:       'rgb(57,232,251)',  // body-cyan
-} as const;
-
-const SPIKE_COUNT = 10;
-
-// Silhouette half-extents relative to baseR. Almost a perfect circle in the
-// reference — very slightly wider than tall. Bottom-half flare is subtle.
-const SX_FACTOR = 1.05;
-const SY_FACTOR = 1.02;
-
-// Face-feature alpha. The tinted PNGs have set stroke thickness; rendering
-// at 0.80 alpha makes them read as "shaded" features rather than bold strokes.
-const FACE_ALPHA = 0.80;
+// Face-feature alpha — the tinted PNGs are bold strokes; 0.85 reads as a
+// shaded feature rather than ink stamped on the body.
+const FACE_ALPHA = 0.85;
 
 interface Img { el: HTMLImageElement; tinted: HTMLCanvasElement }
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
 
 export class PufferFish {
   private imgs: Record<string, Img> = {};
   private ready = false;
+  // Reusable offscreen canvas for masking belly art to the body silhouette.
+  // Sized lazily to the largest render request we've seen.
+  private maskCanvas: HTMLCanvasElement | null = null;
+  private maskCtx: CanvasRenderingContext2D | null = null;
 
   constructor(private base: string) {}
 
   async load(): Promise<void> {
     const defs: [string, string][] = [
-      ['Wing_R',       TINT.wing        ],
-      ['Belly_Dots',   TINT.dots        ],
-      ['Eyes_Relax',   TINT.face        ],
-      ['Eyes_Closed',  TINT.face        ],
-      ['Nose_Open',    TINT.face        ],
-      ['Nose_Closed',  TINT.face        ],
-      ['Mouth_Circle', TINT.mouthCircle ],
-      ['Mouth_Closed', TINT.face        ],
-      ['Glow',         TINT.glow        ],
-      ['Spike1',       TINT.spike       ],
+      ['Body',         COLOR_BODY        ],
+      ['Belly_Base',   COLOR_BELLY_BASE  ],
+      ['Belly_Dots',   COLOR_BELLY_DOTS  ],
+      ['Gradient_1',   COLOR_GRADIENT    ],
+      ['Wing_R',       COLOR_WING        ],
+      ['Eyes_Relax',   COLOR_FACE        ],
+      ['Eyes_Closed',  COLOR_FACE        ],
+      ['Eyes_1',       COLOR_FACE        ],
+      ['Nose_Open',    COLOR_FACE        ],
+      ['Nose_Closed',  COLOR_FACE        ],
+      ['Mouth_Circle', COLOR_FACE        ],
+      ['Mouth_Closed', COLOR_FACE        ],
+      ['Glow',         COLOR_GLOW        ],
+      ['Spike1',       COLOR_SPIKE       ],
     ];
     const failures: string[] = [];
     await Promise.all(defs.map(([n]) => this.loadOne(n, failures)));
     if (failures.length > 0) {
-      // Aggregate failure rather than scattered warns. The fish still renders
-      // without the missing pieces, but a missing asset is almost certainly a
-      // build/deploy problem the developer needs to see.
       console.error(`PufferFish: failed to load ${failures.length} asset(s): ${failures.join(', ')}`);
     }
     for (const [n, c] of defs) this.makeTinted(n, c);
@@ -122,7 +120,7 @@ export class PufferFish {
   }
 
   // Draw a tinted sprite centered at (dx,dy), scaled to `targetW` preserving
-  // aspect ratio. Alpha is applied via globalAlpha when not 1.
+  // aspect ratio. Alpha applied via globalAlpha when not 1.
   private blit(
     ctx: CanvasRenderingContext2D,
     name: string,
@@ -145,28 +143,34 @@ export class PufferFish {
     }
   }
 
-  // Build the single outer silhouette path. Almost-circular with a very slight
-  // bottom flare. Centered at (0,0).
-  // Top half: ellipse with (sx, sy*0.98).
-  // Bottom half: ellipse with (sx, sy*1.02) — a touch fuller below.
-  private buildBody(ctx: CanvasRenderingContext2D, sx: number, sy: number): void {
-    ctx.beginPath();
-    // Top half (left → top → right)
-    ctx.ellipse(0, 0, sx, sy * 0.98, 0, Math.PI, 0, false);
-    // Bottom half (right → bottom → left) — slightly fuller
-    ctx.ellipse(0, 0, sx, sy * 1.02, 0, 0, Math.PI, false);
-    ctx.closePath();
+  // Ensure the offscreen mask canvas can hold a render of `side` px square.
+  private ensureMaskCanvas(side: number): CanvasRenderingContext2D {
+    const needed = Math.ceil(side);
+    if (!this.maskCanvas) {
+      this.maskCanvas = document.createElement('canvas');
+      this.maskCanvas.width  = needed;
+      this.maskCanvas.height = needed;
+      this.maskCtx = this.maskCanvas.getContext('2d')!;
+    } else if (this.maskCanvas.width < needed || this.maskCanvas.height < needed) {
+      this.maskCanvas.width  = needed;
+      this.maskCanvas.height = needed;
+      this.maskCtx = this.maskCanvas.getContext('2d')!;
+    }
+    return this.maskCtx!;
   }
 
-  // cx/cy:  fish center in screen space (silhouette center).
-  // baseR:  body radius unit at scale=1.
-  // scale:  0.78 .. 1.22.
-  // phase:  'inhale' | 'hold' | 'exhale'.
+  // cx/cy:   fish center in screen space.
+  // baseR:   body radius unit at scale=1.
+  // scale:   current PufferFish.localScale (animates SCALE_MIN..SCALE_MAX).
+  // progress: 0 (idle/exhaled) .. 1 (peak inhaled) — drives face Y, face
+  //           scale, mouth scale, belly position/scale, spike size.
+  // phase:   'inhale' | 'hold' | 'exhale' — selects face sprite set.
   render(
     ctx: CanvasRenderingContext2D,
     cx: number, cy: number,
     baseR: number,
     scale: number,
+    progress: number,
     phase: BreathPhase,
   ): void {
     if (!this.ready) return;
@@ -175,85 +179,72 @@ export class PufferFish {
     ctx.translate(cx, cy);
     ctx.scale(scale, scale);
 
-    const sx = baseR * SX_FACTOR;
-    const sy = baseR * SY_FACTOR;
-    // Effective bottom-half scale (matches buildBody's bottom-half ellipse).
-    const sxBot = sx;
-    const syBot = sy * 1.02;
-    const syTop = sy * 0.98;
-
-    // ── 1. Glow halo ───────────────────────────────────────────────────────
-    // Soft bloom around the fish — a gentle halo of light, not a bright ring.
-    // Diameter ~2.6× baseR gives the halo room to extend just past the spikes;
-    // alpha 0.18 keeps it visible against the dark sky without washing out.
-    const glowW = baseR * 2.6;
+    // ── 1. Glow halo (sort order 48, screen blend) ─────────────────────────
+    const glowW = baseR * GLOW_WIDTH_FRAC;
     ctx.save();
     ctx.globalCompositeOperation = 'screen';
-    this.blit(ctx, 'Glow', glowW, 0, 0, 0.18);
+    this.blit(ctx, 'Glow', glowW, 0, 0, 0.22);
     ctx.restore();
 
-    // ── 2. Wings (BEHIND body — inner ~30 % covered, outer ~70 % peeks out) ─
-    // Anchor the wing NEAR the body edge and offset the sprite so only its
-    // INNER ~30 % is tucked behind the silhouette; ~70 % of the wing remains
-    // visible outside the body. Matches the reference where wings clearly
-    // stick out past the silhouette rather than hiding behind it.
-    //
-    // Wings FLAP using a fast sine oscillation around the body-edge anchor.
-    // Flap is driven by absolute time (not breath phase) so the flutter runs
-    // at a consistent rhythm regardless of cycle length — matches the
-    // reference video where wings flap continuously through the cycle.
-    const flapHz    = 1.8;
-    const flapAngle = Math.sin(performance.now() / 1000 * flapHz * Math.PI * 2) * 0.18; // ±~10°
-    const wingW  = baseR * 0.36;
-    const wingH  = baseR * 0.28;
-    // Wings sit UP at face level (above the i=2/i=3 side spikes which are at
-    // angle ±18° from equator, y ≈ -0.32*baseR). At wingY = -0.55*baseR with
-    // wingH = 0.28*baseR, the wing spans y = -0.69..-0.41 vertically — clears
-    // the side spikes (y ≈ -0.32) entirely. wingAnchorX = sx * 0.84 lands on
-    // the silhouette edge at this Y (sqrt(1 - 0.55²/1.02²) ≈ 0.84).
-    const wingY  = -baseR * 0.55;
-    const wingAnchorX = sx * 0.84;
+    // ── 2. Wings (sort 48) — behind body, anchored at body edge ────────────
+    // Unity Wing_R/Wing_L localEulerAngles.z oscillates 0 ↔ -21.6° at ~3 Hz.
+    // Wing_L is the mirror; its sign is flipped so both wings rise/fall
+    // together rather than in alternating lockstep.
+    const flapAngle = Math.sin(performance.now() / 1000 * WING_FLAP_HZ * Math.PI * 2)
+                    * (WING_FLAP_DEG * Math.PI / 180);
+    const wingW = baseR * WING_WIDTH_FRAC;
+    const wingH = baseR * WING_HEIGHT_FRAC;
+    const wingAnchorX = baseR * WING_ANCHOR_X_FRAC;
+    const wingAnchorY = baseR * WING_ANCHOR_Y_FRAC;
     const wImg = this.imgs['Wing_R']?.tinted;
     if (wImg) {
-      // Right wing — sprite anchored so only inner 30 % is hidden by body.
-      // Rotate around the anchor so the wing pivots from where it joins the body.
+      // Right wing — sprite anchored so the inner edge tucks behind the body.
       ctx.save();
-      ctx.translate(wingAnchorX, wingY);
+      ctx.translate(wingAnchorX, wingAnchorY);
       ctx.rotate(flapAngle);
       ctx.drawImage(wImg, -wingW * 0.30, -wingH / 2, wingW, wingH);
       ctx.restore();
 
-      // Left wing — mirrored. Opposite flap direction keeps the motion
-      // symmetric (both wings rise/fall together, not in lockstep).
+      // Left wing — mirrored.
       ctx.save();
-      ctx.translate(-wingAnchorX, wingY);
+      ctx.translate(-wingAnchorX, wingAnchorY);
       ctx.scale(-1, 1);
       ctx.rotate(flapAngle);
       ctx.drawImage(wImg, -wingW * 0.30, -wingH / 2, wingW, wingH);
       ctx.restore();
     }
 
-    // ── 3. Spikes (BEHIND body — only outer tips peek past the silhouette) ─
-    // Spikes are SMALL thorns evenly spaced around the ellipse. For each
-    // angle θ on the outline, the surface point is (sx*cos θ, sy*sin θ)
-    // (top or bottom ellipse). The sprite points UP by default; rotate it
-    // to align with the outward radial. Drawn before the body fill so the
-    // body silhouette covers the inner portion.
-    const spikeSize = baseR * 0.18;
+    // ── 3. Spikes (sort 49) — behind body, 9 around the silhouette ─────────
+    // Unity has 9 spike instances at irregular angles ~0.95 * body radius
+    // from center. Their local scales shrink slightly as the body inflates,
+    // so we interpolate a size multiplier from SPIKE_SCALE_IDLE → PEAK.
+    // Approximate Unity's 9 angles using their measured positions (atan2).
+    const spikeAngles = [
+       0.011,   // Spike_1 (5) right
+       0.853,   // Spike_1     upper right
+       1.353,   // Spike_1 (1) top right
+       1.861,   // Spike_1 (2) top left
+       2.359,   // Spike_1 (3) upper left
+       3.135,   // Spike_1 (4) left
+       3.916,   // Spike_1 (6) lower left
+       4.530,   // Spike_1 (7) bottom
+       5.236,   // Spike_1 (8) lower right
+    ];
+    const spikeScale = lerp(SPIKE_SCALE_IDLE, SPIKE_SCALE_PEAK, progress);
+    const spikeSize  = baseR * SPIKE_SIZE_BASE_FRAC * spikeScale;
     const spImg = this.imgs['Spike1']?.tinted;
     if (spImg) {
       const w = spikeSize;
       const h = spikeSize * (spImg.height / spImg.width);
-      // All 10 spikes drawn — no equator skip. Wings sit at face level
-      // (wingY = -baseR * 0.55) so the i=2/i=3 side spikes at y ≈ -0.32*baseR
-      // are clear of the wing footprint.
-      for (let i = 0; i < SPIKE_COUNT; i++) {
-        const t  = (i / SPIKE_COUNT) * Math.PI * 2 - Math.PI / 2;
-        const dx = Math.cos(t), dy = Math.sin(t);
-        const ex = dy > 0 ? sxBot : sx;
-        const ey = dy > 0 ? syBot : syTop;
-        const px = dx * ex;
-        const py = dy * ey;
+      const r = baseR * SPIKE_RADIAL_FRAC;
+      for (let i = 0; i < SPIKE_COUNT && i < spikeAngles.length; i++) {
+        // Unity angle uses +x right, +y up. Canvas +y down → flip y component.
+        const theta = spikeAngles[i];
+        const dx = Math.cos(theta);
+        const dy = -Math.sin(theta);
+        const px = dx * r;
+        const py = dy * r;
+        // Sprite points UP by default; rotate outward radial.
         const angle = Math.atan2(dy, dx) + Math.PI / 2;
         ctx.save();
         ctx.translate(px, py);
@@ -263,88 +254,121 @@ export class PufferFish {
       }
     }
 
-    // ── 4. Body fill (the single silhouette in bright cyan) ────────────────
-    this.buildBody(ctx, sx, sy);
-    ctx.fillStyle = '#39E8FB';
-    ctx.fill();
+    // ── 4. Body silhouette (sort 50) — Body.png drives the actual shape ────
+    const bodyImg = this.imgs['Body']?.tinted;
+    const bodyW   = baseR * BODY_WIDTH_FRAC;
+    if (bodyImg) {
+      const aspect = bodyImg.height / bodyImg.width;
+      const bH = bodyW * aspect;
+      ctx.drawImage(bodyImg, -bodyW / 2, -bH / 2, bodyW, bH);
+    }
 
-    // ── 5. Dark belly region — clipped to silhouette ───────────────────────
-    // Rebuild silhouette path for clipping (clip consumes the path).
-    ctx.save();
-    this.buildBody(ctx, sx, sy);
-    ctx.clip();
+    // ── 5-6. Belly + dots + gradient (sort 51-52) — clipped to Body shape ──
+    // The Unity prefab uses a SpriteMask on Body so the belly art (sorts 51,
+    // 52) only shows inside the body silhouette. We replicate that by
+    // compositing belly art on an offscreen canvas with the body alpha as a
+    // destination-in mask, then drawing the result onto the main canvas.
+    if (bodyImg) {
+      const bAspect = bodyImg.height / bodyImg.width;
+      const bH = bodyW * bAspect;
+      const side = Math.max(bodyW, bH);
+      const mctx = this.ensureMaskCanvas(side);
+      mctx.save();
+      mctx.setTransform(1, 0, 0, 1, 0, 0);
+      mctx.clearRect(0, 0, this.maskCanvas!.width, this.maskCanvas!.height);
+      // Move origin to centre of the working square.
+      mctx.translate(side / 2, side / 2);
 
-    // The dark belly covers ~bottom half of the silhouette. Its TOP edge sits
-    // at y ≈ -0.19*baseR — just below the bottom edge of the Mouth_Circle
-    // sprite (which spans y -0.57..-0.19 when drawn at width 0.38*baseR with
-    // its 1:1 aspect). Reference Breathe-Out shows the dark belly "barely
-    // touching" the bottom of the big nose, so the bright cyan head + face
-    // occupy the top ~40% of the silhouette and the dark belly fills the
-    // lower ~60%.
-    const bellyCY = baseR * 0.61;            // belly centre — top lands at -0.19
-    const bellyRX = baseR * 1.10;            // wider than silhouette → clipped to outline
-    const bellyRY = baseR * 0.80;            // tall — top at -0.19, bottom at +1.41 (clipped)
-    const bellyTop = bellyCY - bellyRY;       // y of belly top (≈ -0.19)
-    const bellyBot = bellyCY + bellyRY;       // y of belly bottom (≈ +1.41, clipped)
-    const bg = ctx.createLinearGradient(0, bellyTop, 0, bellyBot);
-    bg.addColorStop(0.00, '#159FDC');   // dark blue at top
-    bg.addColorStop(0.35, '#159FDC');   // hold dark until ~middle
-    bg.addColorStop(0.70, '#1CC3ED');   // medium brightening
-    bg.addColorStop(0.90, '#21E0F0');   // bright cyan band
-    bg.addColorStop(1.00, '#27E8F5');   // bright cyan, slightly cooler than head crown
-    ctx.fillStyle = bg;
-    ctx.beginPath();
-    ctx.ellipse(0, bellyCY, bellyRX, bellyRY, 0, 0, Math.PI * 2);
-    ctx.fill();
+      // a. Belly_Base — sort 51. Position animates -2.89 → -2.15 (Body-local),
+      //    scale 0.94 → 1.0.
+      const bellyY     = baseR * lerp(BELLY_Y_IDLE_FRAC, BELLY_Y_PEAK_FRAC, progress);
+      const bellyScale = lerp(BELLY_SCALE_IDLE, BELLY_SCALE_PEAK, progress);
+      const bellyImg   = this.imgs['Belly_Base']?.tinted;
+      if (bellyImg) {
+        const baAspect = bellyImg.height / bellyImg.width;
+        const baW = baseR * BELLY_WIDTH_FRAC * bellyScale;
+        const baH = baW * baAspect;
+        mctx.drawImage(bellyImg, -baW / 2, bellyY - baH / 2, baW, baH);
+      }
 
-    // ── 6. Belly dots (clipped to silhouette) ──────────────────────────────
-    // Belly_Dots.png is wide (~429×144). Draw ONCE only — the asset itself
-    // contains all the dots. Belly now starts at y ≈ -0.19, so dots sit at
-    // y ≈ +0.42 to land mid-belly (between belly top -0.19 and silhouette
-    // bottom +1.05).
-    const dotW  = baseR * 1.05;
-    const dotDY = baseR * 0.42;
-    this.blit(ctx, 'Belly_Dots', dotW, 0, dotDY, 0.95);
-    ctx.restore();
+      // b. Gradient_1 — sort 52. Belly highlight, tinted cyan.
+      const gradImg = this.imgs['Gradient_1']?.tinted;
+      if (gradImg) {
+        const gAspect = gradImg.height / gradImg.width;
+        const gW = baseR * GRADIENT_WIDTH_FRAC * bellyScale;
+        const gH = gW * gAspect;
+        // Unity Gradient_1 sits at y=-1.39 in Belly-local = -0.139 in
+        // PufferFish-local at scale 1.0, with x-scale 1.6 (the gradient is
+        // stretched horizontally). Composes with the belly position.
+        mctx.save();
+        mctx.scale(1.6, 1.0);
+        mctx.drawImage(gradImg, -gW / 2, bellyY - 0.139 * baseR - gH / 2, gW, gH);
+        mctx.restore();
+      }
 
-    // ── 7. Face features (upper third of silhouette) ───────────────────────
-    // Face center sits in the UPPER THIRD of the silhouette. Bright cyan
-    // head spans from y ≈ -1.00*baseR (silhouette top) down to ≈ -0.40*baseR
-    // (belly top edge), so its midpoint is ≈ -0.70*baseR. y is relative to
-    // silhouette centre; negative is up.
-    //
-    // Important: there are NO separate brow marks. During Hold, Nose_Closed
-    // and Eyes_Closed are drawn at the SAME y, so the asset's internal
-    // positioning produces the angled "squinty" marks above the eye dashes
-    // organically — one merged row, not two.
-    const hr = baseR;
-    const eyesY    = hr * EYES_Y_FRAC;
-    const noseY    = hr * NOSE_Y_FRAC;
-    const mouthY   = hr * MOUTH_Y_FRAC;
-    const bigNoseY = hr * BIG_NOSE_Y_FRAC;
+      // c. Belly_Dots — sort 52. Bright cyan dots scattered across the belly.
+      // Unity Belly_Dots local position (0, 2.13) is INSIDE Belly (which is
+      // inside Body sprite at Body's 0.1 scale), so the dots end up near the
+      // PufferFish-local origin: dots_y = 0.1 * (belly_scale * 2.13 + (-2.15))
+      // = 0.1 * (belly_scale * 2.13 - 2.15). At peak that's -0.002 (≈centre);
+      // at idle ~-0.015. In canvas (Y down) as a fraction of baseR (0.398):
+      // tiny positive offset, so dots sit just below the body centre.
+      // Drawn with 'lighter' so the bright cyan dots pop against the dark
+      // belly base — at plain source-over they read as muddy and faint.
+      const dotsImg = this.imgs['Belly_Dots']?.tinted;
+      if (dotsImg) {
+        const dAspect = dotsImg.height / dotsImg.width;
+        const dW = baseR * BELLY_DOTS_WIDTH * bellyScale;
+        const dH = dW * dAspect;
+        const dotsUnityY = bellyScale * 2.13 - 2.15;  // PufferFish-local Unity y
+        const dotsCY = baseR * (-dotsUnityY / 0.398); // canvas Y down
+        mctx.save();
+        mctx.globalCompositeOperation = 'lighter';
+        mctx.drawImage(dotsImg, -dW / 2, dotsCY - dH / 2, dW, dH);
+        mctx.restore();
+      }
+
+      // d. Clip everything to the body alpha (sprite mask).
+      mctx.globalCompositeOperation = 'destination-in';
+      mctx.drawImage(bodyImg, -bodyW / 2, -bH / 2, bodyW, bH);
+      mctx.restore();
+
+      // Draw the composited belly back onto the main canvas at centre.
+      ctx.drawImage(this.maskCanvas!, -side / 2, -side / 2);
+    }
+
+    // ── 7. Face features (sort 53) ─────────────────────────────────────────
+    // Face transform animates: position y -0.558 → -0.671 (baseR fractions),
+    // scale 1.22 → 1.0. Eyes/Nose/Mouth are children with sub-offsets.
+    const faceY     = baseR * lerp(FACE_Y_IDLE_FRAC, FACE_Y_PEAK_FRAC, progress);
+    const faceScale = lerp(FACE_SCALE_IDLE, FACE_SCALE_PEAK, progress);
+
+    const eyesY     = faceY + baseR * EYES_LOCAL_Y_FRAC  * faceScale;
+    const noseY     = faceY + baseR * NOSE_LOCAL_Y_FRAC  * faceScale;
+    const mouthY    = faceY + baseR * MOUTH_LOCAL_Y_FRAC * faceScale;
 
     if (phase === 'inhale') {
-      // Reference p_008 (Breathe In): nose dots close together, a VERY SHORT
-      // mouth dash. Subtle mouth keeps the face calm.
-      this.blit(ctx, 'Eyes_Relax',   hr * EYES_RELAX_WIDTH,            0, eyesY,  FACE_ALPHA);
-      this.blit(ctx, 'Nose_Open',    hr * NOSE_OPEN_WIDTH,             0, noseY,  FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Closed', hr * MOUTH_CLOSED_INHALE_WIDTH,   0, mouthY, FACE_ALPHA);
+      // Reference Unity Puffer_BreatheIn: Eyes_Relax + Nose_Open + Mouth_Closed.
+      // Mouth_Closed scale animates with progress (matches Unity Mouth scale curve).
+      const mouthW = baseR * lerp(MOUTH_CLOSED_WIDTH_IDLE, MOUTH_CLOSED_WIDTH_PEAK, progress) * faceScale;
+      this.blit(ctx, 'Eyes_Relax',   baseR * EYES_RELAX_WIDTH  * faceScale, 0, eyesY,  FACE_ALPHA);
+      this.blit(ctx, 'Nose_Open',    baseR * NOSE_OPEN_WIDTH   * faceScale, 0, noseY,  FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', mouthW,                                  0, mouthY, FACE_ALPHA);
     } else if (phase === 'hold') {
-      // Hold face: 4 distinct angled marks on the eye row + mouth dash.
-      // Eyes_Closed.png has 2 dashes at the FAR L/R edges of its bounding
-      // box, so its width controls how far apart the OUTER dashes sit.
-      // Nose_Closed.png has 2 angled slashes ALSO at the FAR L/R edges,
-      // so drawing it MUCH NARROWER places those slashes near the CENTRE,
-      // producing the INNER pair. The big size difference is intentional:
-      // outer pair lands at ±~0.62*hr, inner pair at ±~0.20*hr.
-      this.blit(ctx, 'Eyes_Closed',  hr * EYES_CLOSED_WIDTH,          0, eyesY,  FACE_ALPHA);
-      this.blit(ctx, 'Nose_Closed',  hr * NOSE_CLOSED_WIDTH,          0, noseY,  FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Closed', hr * MOUTH_CLOSED_HOLD_WIDTH,    0, mouthY, FACE_ALPHA);
+      // Squinty hold pose — both Eyes_Closed and Nose_Closed at the eye row
+      // produce a merged set of 4 angled marks.
+      const mouthW = baseR * MOUTH_CLOSED_WIDTH_PEAK * faceScale;
+      this.blit(ctx, 'Eyes_Closed',  baseR * EYES_CLOSED_WIDTH * faceScale, 0, eyesY,  FACE_ALPHA);
+      this.blit(ctx, 'Nose_Closed',  baseR * NOSE_CLOSED_WIDTH * faceScale, 0, noseY,  FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Closed', mouthW,                                  0, mouthY, FACE_ALPHA);
     } else {
-      // exhale — Eyes_Relax + Mouth_Circle (big nose). NO Nose_Closed: the
-      // big central nose IS the feature; adding brows would clutter it.
-      this.blit(ctx, 'Eyes_Relax',   hr * EYES_RELAX_WIDTH,            0, eyesY,    FACE_ALPHA);
-      this.blit(ctx, 'Mouth_Circle', hr * MOUTH_CIRCLE_WIDTH,          0, bigNoseY, FACE_ALPHA);
+      // exhale — Eyes_Relax + Nose_Closed + Mouth_Circle. Per Unity
+      // Puffer_BreatheOut pptrCurveMapping, Eyes stays Eyes_Relax, Nose
+      // becomes Nose_Closed, Mouth becomes Mouth_Circle (the big O).
+      const circleW = baseR * lerp(MOUTH_CIRCLE_WIDTH_IDLE, MOUTH_CIRCLE_WIDTH_PEAK, progress) * faceScale;
+      this.blit(ctx, 'Eyes_Relax',   baseR * EYES_RELAX_WIDTH  * faceScale, 0, eyesY,  FACE_ALPHA);
+      this.blit(ctx, 'Nose_Closed',  baseR * NOSE_CLOSED_WIDTH * faceScale, 0, noseY,  FACE_ALPHA);
+      this.blit(ctx, 'Mouth_Circle', circleW,                                 0, mouthY, FACE_ALPHA);
     }
 
     ctx.restore();
