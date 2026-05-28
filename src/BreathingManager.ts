@@ -12,7 +12,6 @@ import {
   NOSTRIL_OFFSET_X,
   MOUTH_CIRCLE_WIDTH_IDLE, MOUTH_CIRCLE_WIDTH_PEAK,
   SCALE_MIN, SCALE_MAX, FULL_BREATH_SECS,
-  COLOR_BACKGROUND,
 } from './FishGeometry';
 
 type Screen = 'start' | 'breathing';
@@ -382,12 +381,29 @@ export class BreathingManager {
   }
 
   // ── Background ─────────────────────────────────────────────────────────────
-  // Matches the Unity DeepBreathing prefab "Extra Large BG" sprite colour
-  // (RGB 0.031, 0.094, 0.235 → #08183C). Flat fill, no gradient.
 
-  private drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-    ctx.fillStyle = COLOR_BACKGROUND;
+  private drawBackground(
+    ctx: CanvasRenderingContext2D,
+    W: number, H: number,
+    glowX?: number, glowY?: number, glowR?: number,
+  ): void {
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#193F7E');
+    bg.addColorStop(1, '#3A7BE0');
+    ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
+
+    if (glowX !== undefined && glowY !== undefined && glowR !== undefined) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'screen';
+      const grad = ctx.createRadialGradient(glowX, glowY, 0, glowX, glowY, glowR);
+      grad.addColorStop(0,    'rgba(150,200,255,0.4)');
+      grad.addColorStop(0.5,  'rgba(100,150,255,0.1)');
+      grad.addColorStop(1,    'rgba(0,30,190,0.0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
   }
 
   // ── Loop ──────────────────────────────────────────────────────────────────
